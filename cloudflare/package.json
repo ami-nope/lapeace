@@ -1,0 +1,15 @@
+{
+  "name": "lapeace-dynamic-ssh-worker",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --experimental-strip-types --test tests/*.test.mjs",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261127.1",
+    "typescript": "^5.8.3",
+    "wrangler": "^4.169.0"
+  }
+}

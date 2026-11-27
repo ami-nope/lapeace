@@ -1,0 +1,19 @@
+name = "lapeace-dynamic-ssh"
+main = "src/worker.ts"
+compatibility_date = "2026-11-27"
+workers_dev = false
+
+routes = [
+  { pattern = "lapeace.amii.lol/api/dynamic-ssh*", zone_name = "amii.lol" }
+]
+
+[[durable_objects.bindings]]
+name = "DYNAMIC_IP_REGISTRY"
+class_name = "DynamicIpRegistry"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["DynamicIpRegistry"]
+
+[vars]
+REGISTRATION_SOURCE = "cloudflare-edge"

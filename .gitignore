@@ -1,0 +1,21 @@
+# Node / Next.js
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+cloudflare/.wrangler/
+
+# Python
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Secrets and generated state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+agent/state.json
+cloudflare/.dev.vars*

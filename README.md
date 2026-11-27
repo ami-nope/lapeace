@@ -1,0 +1,313 @@
+# Amii VPN Panel
+
+A private, single-administrator AmneziaWG operations panel. The Next.js app is the
+public-facing frontend/BFF; the FastAPI agent is intended to run behind HTTPS on
+the VPS. The agent reads the existing `lapeace-monitor` JSON output and does not
+keep a separate accounting file. The optional dynamic-IP registry uses
+Cloudflare Durable Object persistent storage; it does not use Vercel memory or
+the function filesystem.
+
+## Project layout
+
+```text
+web/                  Next.js App Router, TypeScript, Tailwind and UI primitives
+  app/                Dashboard, login and authenticated API routes
+  components/         Terminal-style responsive interface
+  lib/                Session signing and shared UI utilities
+  scripts/            Password hash helper
+agent/                Read-only FastAPI telemetry agent and tests
+cloudflare/           Dynamic SSH registry Worker and persistent Durable Object
+deploy/               Deployment templates and instructions
+```
+
+## Safety status
+
+The agent reads `MONITOR_STATE_FILE` (default
+`/opt/lapeace/data/usage.json`) and never writes to that file. It does not
+independently query AWG for dashboard telemetry or calculate peer accounting.
+Peer public keys are reduced to fingerprints/opaque IDs; endpoint and
+preshared-key fields are not returned. The AWG dump parser remains for isolated
+parser validation only. The agent does not modify AWG, WARP, routes, NAT,
+firewall rules, or traffic control.
+
+The Dynamic SSH Manager is a separate, opt-in feature. It detects the request
+address only from Cloudflare's `CF-Connecting-IP`, authenticates the existing
+admin HMAC session, and stores registry records in a Durable Object. Its VPS
+poller is disabled by default and uses a separate bearer token. If enabled, it
+executes only the fixed `warp-cli tunnel ip add/remove <validated-ip>` command
+arguments; there is no arbitrary command API. It never replaces the complete
+WARP exclusion list. The known protected exclusions are included, but enabling
+the poller also requires an explicit confirmation that the complete manual and
+AWG-endpoint exclusion inventory is present in `DYNAMIC_IP_PROTECTED`.
+
+Peer creation, pause/resume, revocation, and client configuration export return
+HTTP 501 and are disabled in the UI. Do not enable them until the existing AWG
+configuration/persistence mechanism and the desired operational behavior have
+been inspected and reviewed. Speed limits and daily-limit enforcement are not
+implemented. No feature is represented as operational until it has been tested
+against the actual VPS setup.
+
+## Local development
+
+1. Install Node.js 20.9 or later and Python 3.11 or later.
+2. From the project root, change to `web/` and run `npm install`.
+3. While in `web/`, generate an admin password hash. In PowerShell, run:
+
+   ```powershell
+   $password = Read-Host "Panel passphrase" -AsSecureString
+   $plain = [System.Net.NetworkCredential]::new("", $password).Password
+   $plain | npm run hash-password
+   Remove-Variable plain, password
+   ```
+
+   Copy the printed `scrypt:...` value to `PANEL_ADMIN_PASSWORD_HASH`. Do not
+   commit it.
+4. Create `.env.local` from `.env.example`; set the admin ID, password hash, and
+   a `PANEL_SESSION_SECRET` of at least 32 random bytes. Generate random values
+   with `node -e "console.log(require('node:crypto').randomBytes(48).toString('base64url'))"`.
+   Set the agent URL/token only after the adapter has been safely deployed. The
+   password hash helper prints only a hash; it does not persist the password.
+5. From `web/`, run `npm run dev`. The dashboard login is at
+   `http://localhost:3000/login`. The agent must be separately configured for
+   telemetry; no sample or fabricated usage values are shown.
+
+The agent development dependencies and focused tests can be run in `agent/` with:
+
+```sh
+python -m venv .venv
+. .venv/bin/activate
+pip install -r requirements-dev.txt
+pytest -q
+```
+
+For Windows PowerShell, activate with `.venv\Scripts\Activate.ps1`.
+
+## Vercel and VPS deployment
+
+Deployment must wait until monitor JSON access, its exact schema, service
+permissions, and the HTTPS path from Vercel have been verified. No SSH or VPS
+credentials belong in Vercel.
+
+### Vercel
+
+1. Import the repository and set the Vercel project **Root Directory** to `web`.
+2. Add `lapeace.amii.lol` under **Settings → Domains** and apply the DNS records
+   Vercel specifies. Confirm HTTPS is active before allowing sign-in.
+3. Add these environment variables in Vercel project settings:
+   - `PANEL_ADMIN_ID`
+   - `PANEL_ADMIN_PASSWORD_HASH`
+   - `PANEL_SESSION_SECRET` (unique random value, at least 32 bytes)
+   - `AGENT_BASE_URL` (HTTPS URL for the agent, never an IP-only plaintext URL)
+   - `AGENT_API_TOKEN` (same high-entropy token configured on the VPS)
+4. Deploy, verify the HTTPS login, invalid-password rejection, session cookie flags,
+   logout, and failure display when the agent is unavailable.
+5. Apply edge rate limiting to `/api/auth/login` and restrict panel access further
+   (for example, an IP allowlist) if your administrator network has stable egress
+   addresses.
+
+### Ubuntu VPS agent — read-only stage only
+
+The agent is a separate, read-only adapter for the existing `lapeace-monitor`.
+Do not install or run it until the monitor JSON schema and read permissions have
+been verified on the server. Keep the existing monitor service and its files
+unchanged. The intended listener is loopback only; Vercel needs a separately
+approved HTTPS reverse-proxy or private-tunnel path to reach it. Never expose
+the FastAPI listener directly to the public Internet.
+
+1. Verify the existing monitor JSON schema, path, atomic-write behavior, and
+   `lapeace-monitor` service identity. Do not share private keys, preshared keys,
+   tokens, or endpoint details in diagnostics.
+2. Run the adapter under a dedicated unprivileged identity. Grant it read and
+   directory-traversal access to the monitor JSON only; do not grant write access
+   to `/opt/lapeace/data/usage.json` or to AWG/WARP configuration.
+3. Install `agent/requirements.txt` in an isolated virtual environment. Set
+   `PANEL_API_TOKEN` to a random secret of at least 32 bytes,
+   `MONITOR_STATE_FILE=/opt/lapeace/data/usage.json`, and `AWG_INTERFACE=awg0`
+   (used as the interface label in the response; the adapter does not query AWG).
+4. Start exactly one Uvicorn worker bound to `127.0.0.1` only:
+
+   ```sh
+   .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8765 --workers 1
+   ```
+
+   Supply the environment variables through the approved service manager. Put
+   the listener behind HTTPS with authentication
+   and network restrictions; the agent itself also checks the bearer token on
+   every endpoint. Do not enable public access to its OpenAPI/docs endpoints.
+5. Configure the Vercel variables above with the HTTPS agent URL and matching
+   API token. Compare the adapter response to a sanitized monitor snapshot,
+   verify upload/download direction and IST daily totals, and verify the source
+   JSON hash and modification time are unchanged after repeated reads.
+6. Keep peer operations disabled until their persistence-safe implementation,
+   backup/rollback strategy, traffic-control scope, and tests are agreed and
+   verified for this exact server.
+
+The telemetry path has no shell or subprocess execution and there is no
+arbitrary command endpoint. The separately gated Dynamic SSH poller executes
+only the fixed per-IP WARP commands described below. Neither component runs
+`awg`, `tc`, `ip`, firewall tools, service restarts, or changes routes/NAT.
+
+## Monitor JSON adapter mapping
+
+The adapter accepts snapshot peers as a list, a `snapshot.peers` list/map, or a
+peer-keyed map. Each peer record must contain `public_key`, `ips`,
+`upload_bytes`, `download_bytes`, `latest_handshake`, `upload_mbps`,
+`download_mbps`, `connected`, `daily_upload_bytes`, and
+`daily_download_bytes`. `daily_usage` accepts either date → peer → counters or
+peer → date → counters, with `upload_bytes`/`download_bytes` values.
+
+The existing API response shape is retained: client upload maps to `rxBytes`
+and `rxBps`; client download maps to `txBytes` and `txBps`. Mbps is converted to
+bytes per second using `1 Mbps = 125,000 bytes/second`. Daily history sums the
+monitor's existing per-peer daily upload/download values by date. The adapter
+does not recalculate usage from raw counters. `last_sample` is returned as
+`sampledAt`; naive timestamps are interpreted as Asia/Kolkata.
+
+## Dynamic SSH Manager — local implementation, not deployed
+
+### Architecture and changed files
+
+```text
+Browser → Cloudflare Worker on /api/dynamic-ssh*
+        → admin cookie verified with the same HMAC key as Next.js
+        → persistent Cloudflare Durable Object registry
+
+FastAPI agent → authenticated registry poll every 10 seconds
+              → strict IPv4/timestamp validation
+              → fixed single-IP warp-cli add/remove operation
+              → separate local managed-IP state and backup
+```
+
+Only these project files are involved:
+
+- `web/components/dashboard.tsx` — authenticated dashboard section and register
+  button; it sends no browser-supplied IP value.
+- `cloudflare/src/worker.ts`, `cloudflare/src/core.ts`,
+  `cloudflare/wrangler.toml`, `cloudflare/package.json`, and
+  `cloudflare/tsconfig.json` — edge IP detection, session verification,
+  persistent registry, service-token routes, Worker route configuration, and
+  test scripts.
+- `cloudflare/tests/core.test.mjs` — focused validation of session, address,
+  expiry, and duplicate-registration behavior.
+- `agent/dynamic_ssh.py`, `agent/app.py` — optional poller and its lifecycle;
+  the existing monitor adapter and monitor JSON are unchanged.
+- `agent/test_dynamic_ssh.py`, `agent/.env.example` — synchronization tests
+  and opt-in settings.
+- `README.md` and `deploy/README.md` — architecture, setup, rollback, safety
+  gates, and deployment blockers.
+
+The Cloudflare Worker handles the same-origin API endpoints directly, so no
+Vercel API route is added for these paths. Cloudflare must proxy
+`lapeace.amii.lol`; the Worker route in `cloudflare/wrangler.toml` is scoped to
+`/api/dynamic-ssh*`. No CORS allowance is enabled. Registration POSTs must have
+the same origin and a valid signed admin cookie. The browser never supplies the
+authoritative IP.
+
+### Secrets and persistence
+
+Set these as **Cloudflare Worker secrets**, not in source control:
+
+- `PANEL_ADMIN_ID` — must exactly match Vercel's admin ID.
+- `PANEL_SESSION_SECRET` — must exactly match Vercel's session-signing secret
+  (at least 32 bytes); this lets the Worker verify, not mint, the existing
+  admin cookie.
+- `DYNAMIC_SYNC_TOKEN` — independent random token of at least 32 characters;
+  also set the identical value in the poller environment.
+
+`REGISTRATION_SOURCE` is a non-secret Worker variable. The Vercel environment
+template otherwise remains unchanged. Registry records and the last
+synchronization report persist in a Durable Object. They are not stored in
+Vercel memory, its ephemeral filesystem, or the read-only monitor JSON.
+
+The agent environment adds:
+
+- `DYNAMIC_SSH_ENABLED=false` — poller starts only when explicitly true.
+- `DYNAMIC_REGISTRY_API_URL` and `DYNAMIC_SYNC_STATUS_URL` — authenticated
+  Worker endpoints.
+- `DYNAMIC_SYNC_TOKEN` — same secret as the Worker.
+- `DYNAMIC_IP_STATE_FILE` — separate local managed-exclusion state file; the
+  default is `/var/lib/lapeace-agent/dynamic-ssh-managed.json`.
+- `DYNAMIC_IP_PROTECTED` — comma-separated complete inventory of manual,
+  AWG-endpoint, and otherwise protected exclusions. The project contains no
+  hard-coded protected IP addresses; supply the current inventory locally.
+- `DYNAMIC_IP_PROTECTED_INVENTORY_CONFIRMED=false` — must be explicitly set to
+  `true` before the poller will make any API or WARP calls.
+
+The last setting is a fail-closed deployment gate, not a way to discover
+exclusions. The complete current manual exclusion inventory and the behavior of
+`warp-cli tunnel ip add` for an already-present address have **not** been
+verified on the VPS. Do not confirm the inventory or enable the poller until
+those facts are checked by the administrator. The agent only removes an IP
+whose address appears in its own managed-state file and whose registry record
+is explicitly expired; absence from the API never causes removal. The monitor
+and `/opt/lapeace/data/usage.json` are not written or restructured.
+
+### Local checks and deployment outline
+
+From `cloudflare/`, run `npm ci`, `npm run typecheck`, and `npm test`. Do not run
+`wrangler deploy` until the implementation and VPS ownership concerns have
+been reviewed. For an eventual deployment, configure the Durable Object binding
+and scoped Worker route through Cloudflare, then set the three Worker secrets
+above and deploy the Worker. Keep Vercel's existing login/session secrets
+unchanged so the Worker can verify the same cookie.
+
+For the eventual Worker setup, from `cloudflare/`:
+
+```sh
+npm ci
+npm run typecheck
+npm test
+npx wrangler secret put PANEL_ADMIN_ID
+npx wrangler secret put PANEL_SESSION_SECRET
+npx wrangler secret put DYNAMIC_SYNC_TOKEN
+npx wrangler deploy
+```
+
+The secret commands prompt for values; use the exact Vercel admin ID/session
+secret and a distinct random sync token. Deployment is intentionally not
+performed as part of this local implementation.
+
+On the VPS, configure the agent process with the environment variables above,
+but keep both opt-in settings false until the protected exclusion inventory,
+`warp-cli` permissions/semantics, state-file owner/mode, and rollback plan are
+verified. Do not modify the existing `lapeace-monitor` service or its JSON data.
+No systemd unit is supplied because the current host service configuration
+and correct privilege model have not been inspected. Use one poller instance
+only.
+
+If a WARP add command's outcome is uncertain, the agent preserves a
+`pending_add` marker and refuses to retry it automatically. Reconcile that IP
+against the actual WARP configuration and local state before resuming polling.
+
+Rollback is fail-safe: first disable `DYNAMIC_SSH_ENABLED` for the Dynamic SSH
+agent process so it stops polling; this retains the local state and current
+WARP exclusions. Disable or remove only the scoped Cloudflare Worker route if
+the web API needs to be withdrawn. Do not flush WARP exclusions or delete the
+Durable Object/local state during rollback. Any removal of individual
+agent-managed entries must be an explicit, reviewed operation using the state
+file as the ownership record.
+
+### Test/safety status and blockers
+
+Automated tests cover pure Worker session/address/expiry/registration logic and
+the agent's mocked polling, validation, expiry, retry/idempotency, protected-IP,
+API/authentication failure, and command-failure behavior. They do not prove
+Cloudflare production routing, Durable Object persistence after a deployment,
+or real `warp-cli` behavior. A local Wrangler integration run exercised
+authenticated registration/re-registration, unauthenticated rejection, private
+IP rejection, poll/status routes, and persistence across a Worker restart. No
+VPS was contacted and no Worker was deployed.
+
+Before enabling/deploying, verify:
+
+1. The full current manual and AWG endpoint exclusion inventory and add every
+   protected entry to `DYNAMIC_IP_PROTECTED`.
+2. Whether `warp-cli tunnel ip add <address>` fails or succeeds for an address
+   already excluded manually. Without this, an existing unlisted exclusion
+   could be claimed as feature-managed and later removed.
+3. The exact local process identity and permissions needed for `warp-cli`, and
+   secure ownership/mode for the state directory. Do not assume root is
+   required or safe.
+4. The Worker route and Durable Object migration on a non-production test
+   domain/account, then separately verify the HTTPS/proxy topology for
+   `lapeace.amii.lol`.
