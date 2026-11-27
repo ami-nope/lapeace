@@ -17,6 +17,13 @@ export interface SyncStatus {
   message: string;
 }
 
+export interface SessionClaims {
+  subject: string;
+  role: "admin" | "user";
+  accountId?: string;
+  expiresAt: number;
+}
+
 function constantTimeEqual(left: string, right: string): boolean {
   const leftBytes = new TextEncoder().encode(left);
   const rightBytes = new TextEncoder().encode(right);
@@ -71,42 +78,72 @@ function cookieValue(request: Request, name: string): string | null {
   return null;
 }
 
-export async function verifyAdminSession(
+export async function readSessionClaims(
   request: Request,
   env: { PANEL_ADMIN_ID: string; PANEL_SESSION_SECRET: string },
-): Promise<boolean> {
+): Promise<SessionClaims | null> {
   if (
     !env.PANEL_ADMIN_ID ||
     new TextEncoder().encode(env.PANEL_SESSION_SECRET).length < 32
   ) {
-    return false;
+    return null;
   }
   const token = cookieValue(request, SESSION_COOKIE);
-  if (!token || token.length > 2048) return false;
+  if (!token || token.length > 2048) return null;
 
   const separator = token.indexOf(".");
-  if (separator <= 0 || separator !== token.lastIndexOf(".")) return false;
+  if (separator <= 0 || separator !== token.lastIndexOf(".")) return null;
   const payload = token.slice(0, separator);
   const signature = token.slice(separator + 1);
   const expected = await signSessionPayload(payload, env.PANEL_SESSION_SECRET);
-  if (!constantTimeEqual(signature, expected)) return false;
+  if (!constantTimeEqual(signature, expected)) return null;
 
   const bytes = decodeBase64Url(payload);
-  if (!bytes) return false;
+  if (!bytes) return null;
   let decoded: string;
   try {
     decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
   } catch {
-    return false;
+    return null;
   }
-  const [adminId, expiresAtText, remainder] = decoded.split("\n");
+  const parts = decoded.split("\n");
+  if (parts.length === 2) {
+    const expiresAt = Number(parts[1]);
+    if (
+      parts[0] === env.PANEL_ADMIN_ID &&
+      Number.isSafeInteger(expiresAt) &&
+      expiresAt > Math.floor(Date.now() / 1000)
+    ) {
+      return { subject: parts[0], role: "admin", expiresAt };
+    }
+    return null;
+  }
+  if (parts.length !== 5 || parts[0] !== "v2") return null;
+
+  const [, subject, role, accountId, expiresAtText] = parts;
   const expiresAt = Number(expiresAtText);
-  return (
-    remainder === undefined &&
-    adminId === env.PANEL_ADMIN_ID &&
-    Number.isSafeInteger(expiresAt) &&
-    expiresAt > Math.floor(Date.now() / 1000)
-  );
+  if (
+    !subject ||
+    (role !== "admin" && role !== "user") ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= Math.floor(Date.now() / 1000)
+  ) {
+    return null;
+  }
+  if (role === "admin") {
+    return subject === env.PANEL_ADMIN_ID && accountId === ""
+      ? { subject, role, expiresAt }
+      : null;
+  }
+  return accountId ? { subject, role, accountId, expiresAt } : null;
+}
+
+export async function verifyAdminSession(
+  request: Request,
+  env: { PANEL_ADMIN_ID: string; PANEL_SESSION_SECRET: string },
+): Promise<boolean> {
+  const claims = await readSessionClaims(request, env);
+  return claims?.role === "admin" && claims.subject === env.PANEL_ADMIN_ID;
 }
 
 export function isPublicIpv4(value: string): boolean {

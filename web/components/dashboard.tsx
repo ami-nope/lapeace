@@ -21,6 +21,7 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Button } from "@/components/ui/button";
+import { AdminAccounts } from "@/components/admin-accounts";
 
 type Peer = {
   id: string;
@@ -78,6 +79,14 @@ type DynamicSSHData = {
   lastSuccessfulRegistration: string | null;
   lastVpsSync: DynamicSyncStatus | null;
   records: DynamicIpRecord[];
+};
+
+type UserSummary = {
+  sampledAt: string;
+  todayBytes: number;
+  uploadBps: number;
+  downloadBps: number;
+  dailyQuotaBytes: number | null;
 };
 
 function formatTimestamp(value: string | null | undefined): string {
@@ -209,11 +218,12 @@ function TrafficGraph({ snapshot }: { snapshot: Snapshot | null }) {
   );
 }
 
-export function Dashboard() {
+export function Dashboard({ role }: { role: "admin" | "user" }) {
   const router = useRouter();
   const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
   const [events, setEvents] = useState<PanelEvent[]>([]);
   const [dynamicSsh, setDynamicSsh] = useState<DynamicSSHData | null>(null);
+  const [userSummary, setUserSummary] = useState<UserSummary | null>(null);
   const [dynamicError, setDynamicError] = useState("");
   const [error, setError] = useState("");
   const [lastUpdated, setLastUpdated] = useState("");
@@ -222,6 +232,30 @@ export function Dashboard() {
 
   const refresh = useCallback(async () => {
     setRefreshing(true);
+    if (role === "user") {
+      try {
+        const response = await fetch("/api/panel/summary", { cache: "no-store" });
+        if (response.status === 401) {
+          router.replace("/login");
+          return;
+        }
+        if (!response.ok) {
+          const result = (await response.json()) as { error?: string };
+          setError(result.error ?? `Account returned HTTP ${response.status}.`);
+          setUserSummary(null);
+          return;
+        }
+        setUserSummary((await response.json()) as UserSummary);
+        setError("");
+      } catch {
+        setError("Account telemetry is unavailable.");
+        setUserSummary(null);
+      } finally {
+        setRefreshing(false);
+      }
+      return;
+    }
+
     try {
       const [snapshotResponse, eventsResponse, dynamicResponse] = await Promise.all([
         fetch("/api/panel/snapshot", { cache: "no-store" }),
@@ -257,7 +291,7 @@ export function Dashboard() {
     } finally {
       setRefreshing(false);
     }
-  }, [router]);
+  }, [role, router]);
 
   async function registerCurrentIp() {
     setRegisteringIp(true);
@@ -307,6 +341,102 @@ export function Dashboard() {
   const peers = snapshot?.peers ?? [];
   const todayBytes = peers.reduce((total, peer) => total + peer.todayBytes, 0);
 
+  if (role === "user") {
+    const dailyQuota = userSummary?.dailyQuotaBytes ?? null;
+    const remaining = dailyQuota === null
+      ? null
+      : Math.max(0, dailyQuota - (userSummary?.todayBytes ?? 0));
+    const quotaPercent = dailyQuota && dailyQuota > 0
+      ? Math.min(100, ((userSummary?.todayBytes ?? 0) / dailyQuota) * 100)
+      : 0;
+    return (
+      <main className="min-h-screen bg-[#090d0a] px-3 py-5 sm:px-6">
+        <div className="mx-auto max-w-4xl space-y-3">
+          <header className="flex items-center justify-between border border-[#26382b] bg-[#0c120e] px-4 py-3">
+            <div>
+              <p className="text-[11px] tracking-[0.12em] text-[#c5d5c7]">
+                <span className="text-[#65d98a]">AMII</span> // PRIVATE LINK
+              </p>
+              <p className="mt-1 text-[9px] text-[#718276]">DAILY USAGE CONSOLE</p>
+            </div>
+            <Button onClick={() => void logout()} size="small" variant="quiet">
+              <LogOut className="h-3 w-3" aria-hidden="true" /> SIGN OUT
+            </Button>
+          </header>
+
+          <section className="panel p-4 sm:p-5">
+            <p className="mono-label">Welcome back</p>
+            <h1 className="mt-1 text-sm text-[#c5d5c7]">
+              Hey there—your link is ready. Here are today’s numbers; keep it smooth.
+            </h1>
+            <p aria-live="polite" className="mt-2 min-h-4 text-[10px] text-[#d8a64e]">
+              {error}
+            </p>
+          </section>
+
+          <div className="grid gap-3 md:grid-cols-3">
+            <Metric
+              label="Data used today"
+              value={formatBytes(userSummary?.todayBytes)}
+              detail="UPLOAD + DOWNLOAD"
+              icon={HardDrive}
+            />
+            <Metric
+              label="Current upload"
+              value={formatRate(userSummary?.uploadBps)}
+              detail="LIVE RATE"
+              icon={ArrowUpFromLine}
+            />
+            <Metric
+              label="Current download"
+              value={formatRate(userSummary?.downloadBps)}
+              detail="LIVE RATE"
+              icon={ArrowDownToLine}
+              accent="text-[#d8a64e]"
+            />
+          </div>
+
+          <section className="panel p-4">
+            <div className="flex flex-wrap items-end justify-between gap-2">
+              <div>
+                <p className="mono-label">Today’s quota</p>
+                <p className="mt-1 text-sm text-[#c5d5c7]">
+                  {dailyQuota === null
+                    ? `${formatBytes(userSummary?.todayBytes)} USED · NO DAILY CAP`
+                    : `${formatBytes(userSummary?.todayBytes)} USED · ${formatBytes(remaining)} REMAINING`}
+                </p>
+              </div>
+              {dailyQuota !== null && (
+                <p className="text-[10px] text-[#718276]">LIMIT {formatBytes(dailyQuota)}</p>
+              )}
+            </div>
+            {dailyQuota !== null && (
+              <div
+                aria-label={`Daily usage ${Math.round(quotaPercent)} percent`}
+                aria-valuemax={100}
+                aria-valuemin={0}
+                aria-valuenow={Math.round(quotaPercent)}
+                className="mt-3 h-2 border border-[#26382b] bg-[#090d0a]"
+                role="progressbar"
+              >
+                <div
+                  className="h-full bg-[#65d98a]"
+                  style={{ width: `${quotaPercent}%` }}
+                />
+              </div>
+            )}
+            <p className="mt-3 text-[9px] text-[#718276]">
+              Usage and limits are informational; this portal does not throttle or disconnect your VPN.
+            </p>
+            <p className="mt-2 text-[9px] text-[#718276]">
+              LAST SAMPLE {formatTimestamp(userSummary?.sampledAt)}
+            </p>
+          </section>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main className="min-h-screen bg-[#090d0a]">
       <div className="flex min-h-screen flex-col lg:flex-row">
@@ -329,6 +459,9 @@ export function Dashboard() {
             </a>
             <a className="flex h-8 shrink-0 items-center gap-2 px-2.5 text-[10px] text-[#718276] hover:text-[#c5d5c7]" href="#events">
               <HardDrive className="h-3.5 w-3.5" aria-hidden="true" /> EVENT LOG
+            </a>
+            <a className="flex h-8 shrink-0 items-center gap-2 px-2.5 text-[10px] text-[#718276] hover:text-[#c5d5c7]" href="#accounts">
+              <Users className="h-3.5 w-3.5" aria-hidden="true" /> ACCOUNTS
             </a>
           </nav>
           <div className="hidden border-t border-[#26382b] p-3 lg:block">
@@ -498,6 +631,14 @@ export function Dashboard() {
                 </div>
               </div>
             </section>
+
+            <AdminAccounts
+              peers={peers.map(({ id, fingerprint, allowedIps }) => ({
+                id,
+                fingerprint,
+                allowedIps,
+              }))}
+            />
 
             <div className="grid gap-3 xl:grid-cols-[minmax(0,1.75fr)_minmax(280px,0.8fr)]">
               <section id="peers" className="panel min-w-0">

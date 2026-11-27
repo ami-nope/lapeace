@@ -1,10 +1,11 @@
 # Amii VPN Panel
 
-A private, single-administrator AmneziaWG operations panel. The Next.js app is the
-public-facing frontend/BFF; the FastAPI agent is intended to run behind HTTPS on
-the VPS. The agent reads the existing `lapeace-monitor` JSON output and does not
-keep a separate accounting file. The optional dynamic-IP registry uses
-Cloudflare Durable Object persistent storage; it does not use Vercel memory or
+A private AmneziaWG operations panel with one administrator and isolated,
+administrator-created user accounts. The Next.js app is the public-facing
+frontend/BFF; the FastAPI agent is intended to run behind HTTPS on the VPS. The
+agent reads the existing `lapeace-monitor` JSON output and does not keep a
+separate accounting file. Account records and the optional dynamic-IP registry
+use Cloudflare Durable Object persistent storage; neither uses Vercel memory or
 the function filesystem.
 
 ## Project layout
@@ -13,7 +14,7 @@ the function filesystem.
 web/                  Next.js App Router, TypeScript, Tailwind and UI primitives
   app/                Dashboard, login and authenticated API routes
   components/         Terminal-style responsive interface
-  lib/                Session signing and shared UI utilities
+  lib/                Session signing, account types and shared UI utilities
   scripts/            Password hash helper
 agent/                Read-only FastAPI telemetry agent and tests
 cloudflare/           Dynamic SSH registry Worker and persistent Durable Object
@@ -30,14 +31,24 @@ preshared-key fields are not returned. The AWG dump parser remains for isolated
 parser validation only. The agent does not modify AWG, WARP, routes, NAT,
 firewall rules, or traffic control.
 
+Admin sign-in uses an environment-configured scrypt password hash. The admin
+can create, suspend, reactivate, update, and delete user accounts, each mapped
+to one existing peer. User sessions can only retrieve their own daily usage,
+configured daily quota, and current upload/download rates; they cannot access
+peer identifiers, the peer table, server totals, account management, or
+Dynamic SSH controls. Account credentials are hashed before persistent storage.
+Login attempts are rate-limited and account/admin events are retained for up to
+three days. Quotas, speeds, connection limits, and time windows are advisory
+display settings only; they do not enforce or change VPN access.
+
 The Dynamic SSH Manager is a separate, opt-in feature. It detects the request
 address only from Cloudflare's `CF-Connecting-IP`, authenticates the existing
 admin HMAC session, and stores registry records in a Durable Object. Its VPS
 poller is disabled by default and uses a separate bearer token. If enabled, it
 executes only the fixed `warp-cli tunnel ip add/remove <validated-ip>` command
 arguments; there is no arbitrary command API. It never replaces the complete
-WARP exclusion list. The known protected exclusions are included, but enabling
-the poller also requires an explicit confirmation that the complete manual and
+WARP exclusion list. Protected exclusions are not hard-coded; enabling the
+poller requires an explicit confirmation that the complete manual and
 AWG-endpoint exclusion inventory is present in `DYNAMIC_IP_PROTECTED`.
 
 Peer creation, pause/resume, revocation, and client configuration export return
@@ -99,6 +110,10 @@ credentials belong in Vercel.
    - `PANEL_SESSION_SECRET` (unique random value, at least 32 bytes)
    - `AGENT_BASE_URL` (HTTPS URL for the agent, never an IP-only plaintext URL)
    - `AGENT_API_TOKEN` (same high-entropy token configured on the VPS)
+   - `ACCOUNT_STORE_API_URL` (Cloudflare Worker account-store route,
+     `https://lapeace.amii.lol/api/account-store`)
+   - `ACCOUNT_STORE_TOKEN` (high-entropy server-to-server bearer secret; also
+     configured as a Cloudflare Worker secret)
 4. Deploy, verify the HTTPS login, invalid-password rejection, session cookie flags,
    logout, and failure display when the agent is unavailable.
 5. Apply edge rate limiting to `/api/auth/login` and restrict panel access further
@@ -213,9 +228,13 @@ Set these as **Cloudflare Worker secrets**, not in source control:
   admin cookie.
 - `DYNAMIC_SYNC_TOKEN` — independent random token of at least 32 characters;
   also set the identical value in the poller environment.
+- `ACCOUNT_STORE_TOKEN` — independent random token of at least 32 characters;
+  also set the identical value in Vercel. It protects account CRUD, login
+  lookup, rate-limit, and audit-store routes from browser access.
 
-`REGISTRATION_SOURCE` is a non-secret Worker variable. The Vercel environment
-template otherwise remains unchanged. Registry records and the last
+`REGISTRATION_SOURCE` is a non-secret Worker variable. Dynamic-IP synchronization
+adds no Vercel variables; the account-store variables are described below.
+Registry records and the last
 synchronization report persist in a Durable Object. They are not stored in
 Vercel memory, its ephemeral filesystem, or the read-only monitor JSON.
 
@@ -247,8 +266,8 @@ and `/opt/lapeace/data/usage.json` are not written or restructured.
 From `cloudflare/`, run `npm ci`, `npm run typecheck`, and `npm test`. Do not run
 `wrangler deploy` until the implementation and VPS ownership concerns have
 been reviewed. For an eventual deployment, configure the Durable Object binding
-and scoped Worker route through Cloudflare, then set the three Worker secrets
-above and deploy the Worker. Keep Vercel's existing login/session secrets
+and scoped Worker route through Cloudflare, then set all listed Worker secrets
+and deploy the Worker. Keep Vercel's existing login/session secrets
 unchanged so the Worker can verify the same cookie.
 
 For the eventual Worker setup, from `cloudflare/`:
@@ -260,12 +279,95 @@ npm test
 npx wrangler secret put PANEL_ADMIN_ID
 npx wrangler secret put PANEL_SESSION_SECRET
 npx wrangler secret put DYNAMIC_SYNC_TOKEN
+npx wrangler secret put ACCOUNT_STORE_TOKEN
 npx wrangler deploy
 ```
 
-The secret commands prompt for values; use the exact Vercel admin ID/session
-secret and a distinct random sync token. Deployment is intentionally not
-performed as part of this local implementation.
+The secret commands prompt for values. Use the exact Vercel admin ID/session
+secret, and set each bearer token to its matching Vercel or agent value.
+Deployment is intentionally not performed as part of this local implementation.
+
+The user-account feature is also local-only until the Worker secret is
+configured and deployed. Generate an admin password hash locally with
+`npm run hash-password` from `web/`; set only the resulting hash as
+`PANEL_ADMIN_PASSWORD_HASH` in Vercel. Do not put an admin password or hash in
+the repository. Set the same `ACCOUNT_STORE_TOKEN` as a Vercel environment
+variable and Cloudflare Worker secret before testing account creation/login.
+
+The admin account-management UI is available only in the signed admin session.
+Creation validates usernames, passwords, peer IDs, and policy values; an
+existing peer can be assigned to only one portal account. Deleting a portal
+account does not revoke or alter its AWG peer. User-facing telemetry is reduced
+server-side to the assigned peer's daily byte total, upload/download rates,
+sample time, and configured daily quota. A malformed agent response is rejected.
+The account store never sends password hashes to the browser.
+
+### Multi-user portal — local implementation, not deployed
+
+The Next.js app remains the authentication boundary for browser requests:
+
+```text
+Admin browser → Next.js signed session → admin-only /api/accounts*
+                                     → ACCOUNT_STORE_TOKEN
+                                     → Cloudflare Worker → Durable Object
+
+User browser  → Next.js signed session → GET /api/panel/summary
+                                     → assigned-account lookup
+                                     → authenticated read-only VPS snapshot
+                                     → sanitized per-peer response
+```
+
+The worker's `/api/account-store*` route accepts only the independent bearer
+secret used by the Next.js server. It stores account records in the existing
+Durable Object, including an scrypt hash, one assigned opaque peer ID,
+administrator notes, status, and advisory policy fields. The browser receives
+neither the account-store token nor password hashes. There is no user
+registration route; account creation and administration require an admin
+session and same-origin writes. Login attempts are limited to five per
+normalized identifier per 15-minute window. The audit view prunes entries
+older than three days.
+
+User sessions can request only their assigned peer's daily total, current
+upload/download speeds, sample timestamp, and daily quota. They cannot request
+raw VPS snapshots, peer identifiers/IPs, global metrics, account lists, audit
+events, or dynamic-IP management. Suspended or deleted accounts are rejected
+when the user summary is requested. The user-facing portal explicitly labels
+quotas and usage as informational; policy values do not enforce traffic or VPN
+access.
+
+The changed account-related files include:
+
+- `web/lib/session.ts`, `web/lib/account-store.ts`, and `web/lib/accounts.ts`
+  — signed role claims, scrypt verification, server-only store client, and
+  shared record types.
+- `web/app/api/auth/login/route.ts` — admin and user login through the
+  persistent account store.
+- `web/app/api/accounts/route.ts`,
+  `web/app/api/accounts/[accountId]/route.ts`, and
+  `web/app/api/accounts/audit/route.ts` — admin-only account and audit APIs.
+- `web/app/api/panel/[...segments]/route.ts` — admin proxy allowlist and the
+  user-only sanitized telemetry endpoint.
+- `web/components/admin-accounts.tsx` and `web/components/dashboard.tsx` —
+  account management and role-separated dashboards.
+- `cloudflare/src/accounts.ts`, `cloudflare/src/worker.ts`, and
+  `cloudflare/tests/accounts.test.mjs` — account validation, persistence,
+  login throttling, audit retention, and focused validation tests.
+
+Before deploying this feature, configure `ACCOUNT_STORE_API_URL` and
+`ACCOUNT_STORE_TOKEN` in Vercel, and set the matching `ACCOUNT_STORE_TOKEN` as a
+Cloudflare Worker secret. Keep `PANEL_ADMIN_PASSWORD_HASH` in Vercel only.
+`PANEL_SESSION_SECRET` must match between Vercel and Cloudflare for the existing
+Dynamic SSH admin-session verification. Do not
+deploy until account creation, admin/user login, role separation, suspend,
+delete, rate limiting, and the privacy of the user summary have been verified
+in a non-production environment.
+
+Run account Worker checks from `cloudflare/` with:
+
+```sh
+npm run typecheck
+npm test
+```
 
 On the VPS, configure the agent process with the environment variables above,
 but keep both opt-in settings false until the protected exclusion inventory,

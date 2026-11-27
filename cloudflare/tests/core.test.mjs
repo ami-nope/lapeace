@@ -5,6 +5,7 @@ import {
   isExpired,
   isPublicIpv4,
   registerRecord,
+  readSessionClaims,
   verifyAdminSession,
 } from "../src/core.ts";
 
@@ -91,4 +92,30 @@ test("only the unexpired signed admin session is accepted", async () => {
     await verifyAdminSession(requestFor(tokenFor("other", nowSeconds + 60)), env),
     false,
   );
+});
+
+test("versioned user sessions are identified but never treated as admin sessions", async () => {
+  const secret = "local-test-session-secret-with-more-than-32-bytes";
+  const expiresAt = Math.floor(Date.now() / 1000) + 60;
+  const payload = Buffer.from(
+    `v2\nuser-account-id\nuser\nuser-account-id\n${expiresAt}`,
+  ).toString("base64url");
+  const signature = createHmac("sha256", secret)
+    .update(payload)
+    .digest("base64url");
+  const request = new Request("https://lapeace.amii.lol/api/dynamic-ssh", {
+    headers: { Cookie: `amii_panel_session=${payload}.${signature}` },
+  });
+  const env = {
+    PANEL_ADMIN_ID: "operator",
+    PANEL_SESSION_SECRET: secret,
+  };
+
+  assert.deepEqual(await readSessionClaims(request, env), {
+    subject: "user-account-id",
+    role: "user",
+    accountId: "user-account-id",
+    expiresAt,
+  });
+  assert.equal(await verifyAdminSession(request, env), false);
 });

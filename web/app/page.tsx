@@ -7,8 +7,9 @@ export const dynamic = "force-dynamic";
 
 export default async function HomePage() {
   const cookieStore = await cookies();
-  if (!verifySessionToken(cookieStore.get(SESSION_COOKIE)?.value)) {
+  const session = verifySessionToken(cookieStore.get(SESSION_COOKIE)?.value);
+  if (!session) {
     redirect("/login");
   }
-  return <Dashboard />;
+  return <Dashboard role={session.role} />;
 }

@@ -1,7 +1,14 @@
-import { createHmac, scryptSync, timingSafeEqual } from "node:crypto";
+import { createHmac, randomBytes, scryptSync, timingSafeEqual } from "node:crypto";
 
 export const SESSION_COOKIE = "amii_panel_session";
 const SESSION_SECONDS = 12 * 60 * 60;
+
+export interface SessionClaims {
+  subject: string;
+  role: "admin" | "user";
+  accountId?: string;
+  expiresAt: number;
+}
 
 export function isSameOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");
@@ -44,7 +51,10 @@ export function verifyAdminCredentials(adminId: string, password: string): boole
   const expectedId = process.env.PANEL_ADMIN_ID;
   const storedHash = process.env.PANEL_ADMIN_PASSWORD_HASH;
   if (!expectedId || !storedHash || !safeEqual(adminId, expectedId)) return false;
+  return verifyScryptPassword(password, storedHash);
+}
 
+export function verifyScryptPassword(password: string, storedHash: string): boolean {
   const parts = storedHash.split(":");
   if (
     parts.length !== 3 ||
@@ -61,38 +71,63 @@ export function verifyAdminCredentials(adminId: string, password: string): boole
   return safeEqual(actual, parts[2].toLowerCase());
 }
 
-export function createSessionToken(): string | null {
+export function hashPassword(password: string): string {
+  const salt = randomBytes(16);
+  const digest = scryptSync(password, salt, 64);
+  return `scrypt:${salt.toString("hex")}:${digest.toString("hex")}`;
+}
+
+export function createSessionToken(
+  claims: Pick<SessionClaims, "subject" | "role"> & { accountId?: string },
+): string | null {
   const secret = sessionSecret();
-  const adminId = process.env.PANEL_ADMIN_ID;
-  if (!secret || !adminId) return null;
+  if (!secret || !claims.subject) return null;
+  if (
+    (claims.role === "admin" && claims.subject !== process.env.PANEL_ADMIN_ID) ||
+    (claims.role === "user" && !claims.accountId)
+  ) {
+    return null;
+  }
 
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
-  const payload = Buffer.from(`${adminId}\n${expiresAt}`).toString("base64url");
+  const payload = Buffer.from(
+    `v2\n${claims.subject}\n${claims.role}\n${claims.accountId ?? ""}\n${expiresAt}`,
+  ).toString("base64url");
   return `${payload}.${sign(payload, secret)}`;
 }
 
-export function verifySessionToken(token: string | undefined): boolean {
+export function verifySessionToken(token: string | undefined): SessionClaims | null {
   const secret = sessionSecret();
-  if (!token || !secret) return false;
+  if (!token || !secret || token.length > 2048) return null;
 
   const [payload, signature, extra] = token.split(".");
-  if (!payload || !signature || extra !== undefined) return false;
-  if (!safeEqual(signature, sign(payload, secret))) return false;
+  if (!payload || !signature || extra !== undefined) return null;
+  if (!safeEqual(signature, sign(payload, secret))) return null;
 
   let decoded: string;
   try {
     decoded = Buffer.from(payload, "base64url").toString("utf8");
   } catch {
-    return false;
+    return null;
   }
-  const [adminId, expiresAtText, remainder] = decoded.split("\n");
+  const parts = decoded.split("\n");
+  if (parts.length !== 5 || parts[0] !== "v2") return null;
+  const [, subject, role, accountId, expiresAtText] = parts;
   const expiresAt = Number(expiresAtText);
-  return (
-    remainder === undefined &&
-    adminId === process.env.PANEL_ADMIN_ID &&
-    Number.isSafeInteger(expiresAt) &&
-    expiresAt > Math.floor(Date.now() / 1000)
-  );
+  if (
+    !subject ||
+    (role !== "admin" && role !== "user") ||
+    !Number.isSafeInteger(expiresAt) ||
+    expiresAt <= Math.floor(Date.now() / 1000)
+  ) {
+    return null;
+  }
+  if (role === "admin") {
+    return subject === process.env.PANEL_ADMIN_ID && accountId === ""
+      ? { subject, role, expiresAt }
+      : null;
+  }
+  return accountId ? { subject, role, accountId, expiresAt } : null;
 }
 
 export { SESSION_SECONDS };

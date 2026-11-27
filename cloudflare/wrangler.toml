@@ -4,7 +4,8 @@ compatibility_date = "2026-11-27"
 workers_dev = false
 
 routes = [
-  { pattern = "lapeace.amii.lol/api/dynamic-ssh*", zone_name = "amii.lol" }
+  { pattern = "lapeace.amii.lol/api/dynamic-ssh*", zone_name = "amii.lol" },
+  { pattern = "lapeace.amii.lol/api/account-store*", zone_name = "amii.lol" }
 ]
 
 [[durable_objects.bindings]]

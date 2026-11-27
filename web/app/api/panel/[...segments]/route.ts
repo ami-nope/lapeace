@@ -1,9 +1,52 @@
 import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
+import { accountStoreFetch } from "@/lib/account-store";
 import { isSameOrigin, SESSION_COOKIE, verifySessionToken } from "@/lib/session";
 
 type RouteContext = { params: Promise<{ segments: string[] }> };
 type Method = "GET" | "POST" | "DELETE";
+
+type UserSnapshot = {
+  sampledAt: string;
+  peers: Array<{
+    id: string;
+    todayBytes: number;
+    rxBps: number;
+    txBps: number;
+  }>;
+};
+
+function isUserSnapshot(value: unknown): value is UserSnapshot {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("sampledAt" in value) ||
+    typeof value.sampledAt !== "string" ||
+    !("peers" in value) ||
+    !Array.isArray(value.peers)
+  ) {
+    return false;
+  }
+  return value.peers.every(
+    (peer) =>
+      typeof peer === "object" &&
+      peer !== null &&
+      "id" in peer &&
+      typeof peer.id === "string" &&
+      "todayBytes" in peer &&
+      typeof peer.todayBytes === "number" &&
+      Number.isFinite(peer.todayBytes) &&
+      peer.todayBytes >= 0 &&
+      "rxBps" in peer &&
+      typeof peer.rxBps === "number" &&
+      Number.isFinite(peer.rxBps) &&
+      peer.rxBps >= 0 &&
+      "txBps" in peer &&
+      typeof peer.txBps === "number" &&
+      Number.isFinite(peer.txBps) &&
+      peer.txBps >= 0,
+  );
+}
 
 function isAllowed(method: Method, segments: string[]): boolean {
   const path = segments.join("/");
@@ -25,13 +68,122 @@ function isAllowed(method: Method, segments: string[]): boolean {
   return false;
 }
 
+async function userSummary(accountId: string): Promise<Response> {
+  let accountResponse: Response;
+  try {
+    accountResponse = await accountStoreFetch(
+      `internal/profile?id=${encodeURIComponent(accountId)}`,
+    );
+  } catch {
+    return NextResponse.json({ error: "Account store is unavailable." }, { status: 503 });
+  }
+  if (!accountResponse.ok) {
+    return NextResponse.json(
+      { error: "Account is unavailable." },
+      { status: accountResponse.status === 404 ? 401 : accountResponse.status },
+    );
+  }
+  const accountResult = (await accountResponse.json()) as {
+    account: {
+      status: "active" | "suspended";
+      peerId: string;
+      dailyQuotaBytes: number | null;
+    };
+  };
+  if (accountResult.account.status !== "active") {
+    return NextResponse.json({ error: "Account is unavailable." }, { status: 401 });
+  }
+
+  const baseUrl = process.env.AGENT_BASE_URL;
+  const apiToken = process.env.AGENT_API_TOKEN;
+  if (!baseUrl || !apiToken) {
+    return NextResponse.json(
+      { error: "The VPS agent is not configured." },
+      { status: 503 },
+    );
+  }
+  let target: URL;
+  try {
+    target = new URL("/api/v1/snapshot", baseUrl);
+  } catch {
+    return NextResponse.json(
+      { error: "The VPS agent address is invalid." },
+      { status: 503 },
+    );
+  }
+  if (
+    target.protocol !== "https:" &&
+    target.hostname !== "localhost" &&
+    target.hostname !== "127.0.0.1"
+  ) {
+    return NextResponse.json(
+      { error: "The VPS agent must use HTTPS." },
+      { status: 503 },
+    );
+  }
+
+  let upstream: Response;
+  try {
+    upstream = await fetch(target, {
+      headers: { Authorization: `Bearer ${apiToken}` },
+      cache: "no-store",
+      signal: AbortSignal.timeout(7_000),
+    });
+  } catch (error) {
+    if (error instanceof TypeError || error instanceof DOMException) {
+      return NextResponse.json(
+        { error: "The VPS agent could not be reached." },
+        { status: 502 },
+      );
+    }
+    throw error;
+  }
+  if (!upstream.ok) {
+    return NextResponse.json(
+      { error: "The VPS agent returned an error." },
+      { status: upstream.status },
+    );
+  }
+
+  let snapshot: UserSnapshot;
+  try {
+    const payload: unknown = await upstream.json();
+    if (!isUserSnapshot(payload)) {
+      return NextResponse.json(
+        { error: "The VPS agent returned invalid telemetry." },
+        { status: 502, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    snapshot = payload;
+  } catch {
+    return NextResponse.json(
+      { error: "The VPS agent returned invalid telemetry." },
+      { status: 502, headers: { "Cache-Control": "no-store" } },
+    );
+  }
+  const peer = snapshot.peers.find(
+    (record) => record.id === accountResult.account.peerId,
+  );
+  return NextResponse.json(
+    {
+      sampledAt: snapshot.sampledAt,
+      todayBytes: peer?.todayBytes ?? 0,
+      uploadBps: peer?.rxBps ?? 0,
+      downloadBps: peer?.txBps ?? 0,
+      dailyQuotaBytes: accountResult.account.dailyQuotaBytes,
+    },
+    { headers: { "Cache-Control": "no-store" } },
+  );
+}
+
 async function proxy(
   request: Request,
   context: RouteContext,
   method: Method,
 ) {
   const cookieStore = await cookies();
-  if (!verifySessionToken(cookieStore.get(SESSION_COOKIE)?.value)) {
+  const session = verifySessionToken(cookieStore.get(SESSION_COOKIE)?.value);
+  if (!session) {
     return NextResponse.json({ error: "Authentication required." }, { status: 401 });
   }
 
@@ -42,6 +194,12 @@ async function proxy(
   }
 
   const { segments } = await context.params;
+  if (session.role === "user") {
+    if (method === "GET" && segments.join("/") === "summary" && session.accountId) {
+      return userSummary(session.accountId);
+    }
+    return NextResponse.json({ error: "Unknown panel operation." }, { status: 404 });
+  }
   if (!isAllowed(method, segments)) {
     return NextResponse.json({ error: "Unknown panel operation." }, { status: 404 });
   }

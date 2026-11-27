@@ -57,7 +57,7 @@ export function LoginForm() {
             <div>
               <p className="mono-label mb-2">Private operations terminal</p>
               <h1 id="login-title" className="text-sm font-medium tracking-wide">
-                Administrator sign-in
+                Account sign-in
               </h1>
             </div>
             <LockKeyhole className="mt-1 h-4 w-4 text-[#65d98a]" aria-hidden="true" />
@@ -79,7 +79,7 @@ export function LoginForm() {
 
           <form onSubmit={submit} className="space-y-4">
             <label className="block">
-              <span className="mono-label mb-1.5 block">Administrator ID</span>
+              <span className="mono-label mb-1.5 block">Account ID</span>
               <span className="flex h-9 items-center border border-[#354839] bg-[#090d0a] px-2.5 focus-within:border-[#65d98a]">
                 <KeyRound className="mr-2 h-3.5 w-3.5 text-[#718276]" aria-hidden="true" />
                 <input
