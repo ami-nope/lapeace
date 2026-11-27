@@ -120,6 +120,224 @@ credentials belong in Vercel.
    (for example, an IP allowlist) if your administrator network has stable egress
    addresses.
 
+### Authenticated first release
+
+The login, account, and telemetry flow is:
+
+```text
+Browser → same-origin Next.js route handler on Vercel
+        → Cloudflare Worker at /api/account-store*
+        → existing DYNAMIC_IP_REGISTRY Durable Object
+        → account records and auth-version state
+
+Vercel → HTTPS VPS agent (only for dashboard telemetry)
+```
+
+The Worker is named `lapeace-dynamic-ssh`. `cloudflare/wrangler.toml` binds
+`DYNAMIC_IP_REGISTRY` to the existing `DynamicIpRegistry` class, whose stable
+object name is `lapeace-dynamic-ip-registry`. The v1 SQLite Durable Object
+migration remains unchanged. Account records use separate storage-key prefixes
+in that same object; there is no D1 database and no replacement or reset of the
+Dynamic SSH object. The Worker has custom routes for
+`lapeace.amii.lol/api/account-store*`, `lapeace.amii.lol/api/dynamic-ssh*`, and
+`lapeace.amii.lol/health`. Its `workers_dev = false` configuration means the
+intended production URL is the custom domain, not a `workers.dev` URL.
+
+The default account-store URL in `web/.env.example`,
+`https://lapeace.amii.lol/api/account-store`, is correct for the current
+`accountStoreFetch()` implementation: it appends paths such as
+`internal/session/validate`, and the Cloudflare route matches that prefix.
+This is conditional on Cloudflare routing that hostname/path to the deployed
+Worker and the domain being proxied through the configured Cloudflare zone.
+Neither the live Worker route nor Vercel's production environment can be
+verified from this repository. Vercel communicates with the account Worker
+server-to-server through Next.js code; browser JavaScript receives neither the
+account-store URL token nor the VPS agent token. Account API requests do not
+need CORS. Dynamic SSH browser routes are same-origin and use origin checks.
+
+All application settings below are read at runtime (server-side). Vercel
+environment changes require a new Vercel deployment before the running
+deployment sees them. Never prefix these with `NEXT_PUBLIC_`.
+
+| Variable | Required | Where / format | Purpose |
+| --- | --- | --- | --- |
+| `PANEL_ADMIN_ID` | Yes | Vercel and Cloudflare Worker; exact existing administrator ID | Admin login and Worker session identity check. |
+| `PANEL_ADMIN_PASSWORD_HASH` | Yes | Vercel only; `scrypt:<32 hex salt>:<128 hex digest>` | Admin password verifier; never store the plaintext password. |
+| `PANEL_SESSION_SECRET` | Yes | Same random value in Vercel and Cloudflare Worker; at least 32 bytes | HMAC session signing and Worker verification. Rotating it invalidates every session. |
+| `AGENT_BASE_URL` | For telemetry | Vercel only; HTTPS URL; loopback HTTP is allowed for local development | Read-only VPS agent endpoint. Not needed for login/account CRUD. |
+| `AGENT_API_TOKEN` | For telemetry | Vercel only; high-entropy bearer token matching the agent | Authenticates server-side snapshot requests. Not needed for login/account CRUD. |
+| `ACCOUNT_STORE_API_URL` | Yes | Vercel only; `https://lapeace.amii.lol/api/account-store` | Base URL for the server-side account Worker client. |
+| `ACCOUNT_STORE_TOKEN` | Yes | Same high-entropy value in Vercel and Cloudflare Worker; at least 32 characters | Bearer authentication for account-store requests. |
+
+Additional Worker configuration actually referenced by source:
+
+- `DYNAMIC_SYNC_TOKEN` is a Cloudflare Worker secret only when the VPS Dynamic
+  SSH poller is enabled. It must match the value already configured for that
+  agent. Do not rotate or change the VPS value as part of this release.
+- `REGISTRATION_SOURCE` is a non-secret Worker variable already defined in
+  `cloudflare/wrangler.toml`.
+- `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` are GitHub Actions
+  deployment secrets, not Worker runtime secrets.
+- `NODE_ENV` is supplied by Vercel. It controls the `Secure` cookie flag.
+
+The session cookie is host-only, `HttpOnly`, `SameSite=Strict`, `Path=/`, and
+`Secure` in production. Sessions expire after 12 hours. Every protected Next.js
+request verifies the signature and checks the account's live status and
+`authVersion` in the Durable Object. Disabling/deleting a user or resetting that
+user's password invalidates old sessions. Logout increments the corresponding
+auth version (all sessions for that single administrator or user are invalidated).
+Changing the administrator password hash should be accompanied by rotating
+`PANEL_SESSION_SECRET` in Vercel and Cloudflare, which invalidates all old
+signed sessions. If the account store is unavailable, protected requests fail
+closed.
+
+#### First administrator setup
+
+The administrator is environment-configured, not a row in the user-account
+store. This avoids duplicate bootstrap accounts and never creates or resets a
+password automatically. Set `PANEL_ADMIN_ID` to the existing administrator's
+exact ID (the example uses `ami_nope`); do not change it to a new identity
+without approval.
+
+1. To preserve the current administrator credential, use that existing
+   passphrase with the generator below and configure its hash in Vercel. Only
+   choose a new passphrase if an administrator password rotation is intended;
+   that changes the credential used to sign in. From `web/` in PowerShell, put
+   the generated hash directly on the clipboard so it is not printed:
+
+   ```powershell
+   $secure = Read-Host "Administrator passphrase" -AsSecureString
+   $plain = [System.Net.NetworkCredential]::new("", $secure).Password
+   $hash = $plain | node .\scripts\hash-password.mjs
+   Set-Clipboard -Value $hash
+   Remove-Variable secure, plain, hash
+   ```
+
+   Paste the hash into the Vercel `PANEL_ADMIN_PASSWORD_HASH` secret field.
+   The generator rejects passwords shorter than 12 characters. Do not put
+   either value in chat, source control, or `.env.example`.
+2. Generate a 48-byte session key locally without printing it:
+
+   ```powershell
+   $secret = node -e "process.stdout.write(require('node:crypto').randomBytes(48).toString('base64url'))"
+   Set-Clipboard -Value $secret
+   Remove-Variable secret
+   ```
+
+   Paste the same value into Vercel and the Cloudflare Worker secret
+   `PANEL_SESSION_SECRET`. Clear the clipboard after configuration.
+3. Configure `PANEL_ADMIN_ID` and the matching `PANEL_SESSION_SECRET` in
+   Cloudflare, plus the required `ACCOUNT_STORE_TOKEN`. Configure the matching
+   `ACCOUNT_STORE_API_URL` and `ACCOUNT_STORE_TOKEN` in Vercel. Configure
+   `DYNAMIC_SYNC_TOKEN` only if the existing poller is already configured with
+   a matching value.
+4. Configure `AGENT_BASE_URL` and `AGENT_API_TOKEN` in Vercel only if the
+   telemetry agent is reachable over the approved HTTPS path. No VPS changes
+   are required for login or account management; user telemetry requires the
+   existing read-only agent.
+
+The first successful deployment is the bootstrap; there is no one-time seed
+command. To verify the administrator, visit `https://lapeace.amii.lol/login`,
+sign in with the configured ID and passphrase, refresh the dashboard, then
+sign out. Never put the passphrase or hash in a command-line argument.
+
+#### Cloudflare setup and deployment
+
+No Durable Object binding or migration changes are required for accounts. Keep
+the current class, binding, object name, migration tag, and SQLite storage. Set
+the secrets in the Cloudflare account (each command prompts for its value):
+
+```sh
+cd cloudflare
+npm ci
+npm run typecheck
+npm test
+npx wrangler secret put PANEL_ADMIN_ID
+npx wrangler secret put PANEL_SESSION_SECRET
+npx wrangler secret put ACCOUNT_STORE_TOKEN
+npx wrangler secret put DYNAMIC_SYNC_TOKEN
+npx wrangler deploy
+```
+
+Use the matching values already configured in Vercel; for
+`DYNAMIC_SYNC_TOKEN`, use the existing agent value rather than changing the VPS.
+If the poller is disabled and no existing sync token is available, omit that
+secret; its endpoints fail closed with 401. Run deployment only after reviewing
+the diff and authorizing release. Do not run `wrangler deploy` from the
+repository root; the configuration is `cloudflare/wrangler.toml`.
+
+Safe post-deployment checks (these reveal only status codes, not account data):
+
+```sh
+curl --silent --show-error https://lapeace.amii.lol/health
+curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  https://lapeace.amii.lol/api/account-store/internal/accounts
+curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  --header 'Authorization: Bearer intentionally-invalid' \
+  https://lapeace.amii.lol/api/account-store/internal/accounts
+```
+
+Expected results are `{"status":"ok"}` for health and `401` for both
+unauthenticated and invalid-token account calls. To check a configured token
+without placing it in shell history or printing response data:
+
+```sh
+read -s ACCOUNT_STORE_TOKEN
+printf '\n'
+curl --silent --show-error --output /dev/null --write-out '%{http_code}\n' \
+  --header "Authorization: Bearer ${ACCOUNT_STORE_TOKEN}" \
+  https://lapeace.amii.lol/api/account-store/internal/accounts
+unset ACCOUNT_STORE_TOKEN
+```
+
+The authenticated check should return `200`. Do not enable shell tracing or
+print the token.
+
+#### GitHub deployment workflow
+
+`.github/workflows/cloudflare-worker.yml` runs Worker typecheck/tests on pull
+requests and pushes to `main`. It does not deploy automatically. A manual
+`workflow_dispatch` from `main` runs tests first, then deploys from `cloudflare/`
+through the GitHub `production` environment. Configure that environment with
+required reviewers and the secrets `CLOUDFLARE_API_TOKEN` and
+`CLOUDFLARE_ACCOUNT_ID`. Scope the API token to the minimum Worker script,
+route, and Durable Object migration permissions Wrangler requires. Runtime
+Worker secrets remain configured in Cloudflare and are never placed in the
+workflow. Vercel continues to deploy the frontend through its existing GitHub
+integration; the Vercel project root must be `web/` and its build command is
+`npm run build`.
+
+#### Post-deployment end-to-end checklist
+
+Run these checks manually after deployment; local build/test results do not
+prove production configuration:
+
+1. Visit `https://lapeace.amii.lol`; an unauthenticated request to `/` should
+   redirect to `/login`. `/login` itself remains public.
+2. Log in as the configured administrator, refresh, and confirm the session
+   persists; then log out and verify the old cookie no longer authorizes API
+   requests.
+3. As administrator, create a standard user assigned to a known existing peer.
+4. Log out and sign in as that user. Confirm only their daily usage, quota, and
+   upload/download rates appear.
+5. As that user, request `/api/accounts`, `/api/accounts/audit`, and
+   `/api/panel/snapshot`; expect authorization failure or not-found. Change
+   account/peer IDs in requests and confirm no other account's data is returned.
+6. Suspend the user and confirm their old session is rejected on the next page
+   or API request. Reset their password and confirm prior sessions are rejected.
+   Delete the user and confirm the same.
+7. Verify an expired session is redirected to login and logout clears the
+   cookie.
+8. As administrator, verify Dynamic SSH registration/status and the existing
+   dashboard/agent telemetry. If the agent is unavailable, login and account
+   management can still work, but telemetry is not verified.
+9. Confirm the VPS monitor, AWG, WARP, routes, firewall, peer configuration,
+   and services were not changed.
+
+Until these live checks are run, mark production login, cookies, account
+revocation, Worker route reachability, Dynamic SSH continuity, and VPS
+telemetry as **NOT VERIFIED**.
+
 ### Ubuntu VPS agent — read-only stage only
 
 The agent is a separate, read-only adapter for the existing `lapeace-monitor`.

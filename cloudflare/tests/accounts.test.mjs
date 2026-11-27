@@ -52,6 +52,7 @@ test("public account records never contain password hashes or normalized IDs", (
     username: "test_user",
     normalizedUsername: "test_user",
     passwordHash: `scrypt:${"a".repeat(32)}:${"b".repeat(128)}`,
+    authVersion: 0,
     peerId: "a".repeat(64),
     note: "",
     status: "active",
@@ -69,5 +70,6 @@ test("public account records never contain password hashes or normalized IDs", (
   const result = publicAccount(account);
   assert.equal("passwordHash" in result, false);
   assert.equal("normalizedUsername" in result, false);
+  assert.equal("authVersion" in result, false);
   assert.equal(result.peerId, account.peerId);
 });

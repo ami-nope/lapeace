@@ -61,7 +61,9 @@ test("only the unexpired signed admin session is accepted", async () => {
   const secret = "local-test-session-secret-with-more-than-32-bytes";
   const nowSeconds = Math.floor(Date.now() / 1000);
   const tokenFor = (adminId, expiry, signingSecret = secret) => {
-    const payload = Buffer.from(`${adminId}\n${expiry}`).toString("base64url");
+    const payload = Buffer.from(
+      `v3\n${adminId}\nadmin\n\n0\n${expiry}`,
+    ).toString("base64url");
     const signature = createHmac("sha256", signingSecret)
       .update(payload)
       .digest("base64url");
@@ -98,7 +100,7 @@ test("versioned user sessions are identified but never treated as admin sessions
   const secret = "local-test-session-secret-with-more-than-32-bytes";
   const expiresAt = Math.floor(Date.now() / 1000) + 60;
   const payload = Buffer.from(
-    `v2\nuser-account-id\nuser\nuser-account-id\n${expiresAt}`,
+    `v3\nuser-account-id\nuser\nuser-account-id\n0\n${expiresAt}`,
   ).toString("base64url");
   const signature = createHmac("sha256", secret)
     .update(payload)
@@ -115,6 +117,7 @@ test("versioned user sessions are identified but never treated as admin sessions
     subject: "user-account-id",
     role: "user",
     accountId: "user-account-id",
+    authVersion: 0,
     expiresAt,
   });
   assert.equal(await verifyAdminSession(request, env), false);
