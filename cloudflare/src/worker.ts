@@ -14,7 +14,6 @@ import {
   isPublicIpv4,
   readSessionClaims,
   registerRecord,
-  verifyAdminSession,
   type DynamicIpRecord,
   type SyncStatus,
 } from "./core";
@@ -24,14 +23,15 @@ const ACCOUNT_API_PREFIX = "/api/account-store";
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
 const LOGIN_ATTEMPT_LIMIT = 5;
 const AUDIT_RETENTION_MS = 3 * 24 * 60 * 60 * 1000;
+const ADMIN_AUTH_VERSION_KEY = "session-version:admin";
 
 export interface Env {
   DYNAMIC_IP_REGISTRY: DurableObjectNamespace<DynamicIpRegistry>;
-  PANEL_ADMIN_ID: string;
-  PANEL_SESSION_SECRET: string;
-  DYNAMIC_SYNC_TOKEN: string;
-  ACCOUNT_STORE_TOKEN: string;
-  REGISTRATION_SOURCE: string;
+  PANEL_ADMIN_ID?: string;
+  PANEL_SESSION_SECRET?: string;
+  DYNAMIC_SYNC_TOKEN?: string;
+  ACCOUNT_STORE_TOKEN?: string;
+  REGISTRATION_SOURCE?: string;
 }
 
 interface RegistrySummary {
@@ -49,6 +49,13 @@ interface AuditRecord {
   at: string;
   action: string;
   subject: string;
+}
+
+interface SessionIdentity {
+  role: "admin" | "user";
+  subject: string;
+  accountId: string | null;
+  authVersion: number;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -78,8 +85,11 @@ function sameOrigin(request: Request): boolean {
   }
 }
 
-function bearerAuthorized(request: Request, token: string): boolean {
-  if (token.length < 32) return false;
+function bearerAuthorized(
+  request: Request,
+  token: string | undefined,
+): boolean {
+  if (!token || token.length < 32) return false;
   const authorization = request.headers.get("authorization") ?? "";
   if (!authorization.startsWith("Bearer ")) return false;
   const supplied = new TextEncoder().encode(authorization.slice(7));
@@ -197,6 +207,29 @@ function validAccountPatch(value: unknown): value is AccountPatch {
   );
 }
 
+function validSessionIdentity(value: unknown): value is SessionIdentity {
+  if (
+    typeof value !== "object" ||
+    value === null ||
+    !("role" in value) ||
+    (value.role !== "admin" && value.role !== "user") ||
+    !("subject" in value) ||
+    typeof value.subject !== "string" ||
+    value.subject.length < 1 ||
+    value.subject.length > 128 ||
+    !("accountId" in value) ||
+    !(value.accountId === null || typeof value.accountId === "string") ||
+    !("authVersion" in value) ||
+    !Number.isSafeInteger(value.authVersion) ||
+    Number(value.authVersion) < 0
+  ) {
+    return false;
+  }
+  return value.role === "admin"
+    ? value.accountId === null
+    : value.accountId === value.subject;
+}
+
 function registryStub(env: Env): DurableObjectStub<DynamicIpRegistry> {
   const id = env.DYNAMIC_IP_REGISTRY.idFromName("lapeace-dynamic-ip-registry");
   return env.DYNAMIC_IP_REGISTRY.get(id);
@@ -217,6 +250,29 @@ async function registryRequest(
   );
 }
 
+async function verifyLiveAdminSession(
+  request: Request,
+  env: Env,
+): Promise<boolean> {
+  const claims = await readSessionClaims(request, env);
+  if (
+    !claims ||
+    claims.role !== "admin" ||
+    claims.subject !== env.PANEL_ADMIN_ID
+  ) {
+    return false;
+  }
+  const response = await registryRequest(env, "/internal/session/validate", "POST", {
+    role: claims.role,
+    subject: claims.subject,
+    accountId: null,
+    authVersion: claims.authVersion,
+  });
+  if (!response.ok) return false;
+  const result = await response.json<{ valid?: unknown }>().catch(() => null);
+  return result?.valid === true;
+}
+
 async function readJson(request: Request): Promise<unknown> {
   const contentLength = Number(request.headers.get("content-length") ?? "0");
   if (contentLength > 4096) throw new Error("Request body is too large.");
@@ -228,6 +284,12 @@ async function readJson(request: Request): Promise<unknown> {
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const { pathname } = new URL(request.url);
+
+    if (pathname === "/health" && request.method === "GET") {
+      const response = await registryRequest(env, "/internal/health");
+      if (!response.ok) return jsonResponse({ status: "unavailable" }, 503);
+      return jsonResponse({ status: "ok" });
+    }
 
     if (pathname.startsWith(`${ACCOUNT_API_PREFIX}/`)) {
       if (!bearerAuthorized(request, env.ACCOUNT_STORE_TOKEN)) {
@@ -261,7 +323,7 @@ export default {
     }
 
     if (pathname === "/api/dynamic-ssh" && request.method === "GET") {
-      if (!(await verifyAdminSession(request, env))) {
+      if (!(await verifyLiveAdminSession(request, env))) {
         return jsonResponse({ error: "Authentication required." }, 401);
       }
       const currentIp = trustedClientIp(request);
@@ -289,7 +351,7 @@ export default {
     }
 
     if (pathname === "/api/dynamic-ssh/register" && request.method === "POST") {
-      if (!(await verifyAdminSession(request, env))) {
+      if (!(await verifyLiveAdminSession(request, env))) {
         return jsonResponse({ error: "Authentication required." }, 401);
       }
       if (!sameOrigin(request)) {
@@ -397,11 +459,98 @@ export class DynamicIpRegistry extends DurableObject<Env> {
   }
 
   private async getAccountById(id: string): Promise<AccountRecord | undefined> {
-    return this.ctx.storage.get<AccountRecord>(`account:${id}`);
+    const stored = await this.ctx.storage.get<AccountRecord>(`account:${id}`);
+    if (!stored) return undefined;
+    return {
+      ...stored,
+      authVersion: Number.isSafeInteger(stored.authVersion)
+        ? stored.authVersion
+        : 0,
+    };
   }
 
   async fetch(request: Request): Promise<Response> {
     const { pathname, searchParams } = new URL(request.url);
+
+    if (pathname === "/internal/health" && request.method === "GET") {
+      return jsonResponse({ status: "ok" });
+    }
+
+    if (
+      pathname === "/internal/session/admin-version" &&
+      request.method === "GET"
+    ) {
+      const authVersion =
+        (await this.ctx.storage.get<number>(ADMIN_AUTH_VERSION_KEY)) ?? 0;
+      return jsonResponse({ authVersion });
+    }
+
+    if (
+      pathname === "/internal/session/validate" &&
+      request.method === "POST"
+    ) {
+      const payload = await request.json<unknown>().catch(() => null);
+      if (!validSessionIdentity(payload)) {
+        return jsonResponse({ error: "Invalid session validation request." }, 400);
+      }
+      if (payload.role === "admin") {
+        const authVersion =
+          (await this.ctx.storage.get<number>(ADMIN_AUTH_VERSION_KEY)) ?? 0;
+        return jsonResponse({
+          valid:
+            payload.subject === this.env.PANEL_ADMIN_ID &&
+            payload.authVersion === authVersion,
+        });
+      }
+      if (!payload.accountId) {
+        return jsonResponse({ error: "Invalid user session identity." }, 400);
+      }
+      const account = await this.getAccountById(payload.accountId);
+      return jsonResponse({
+        valid:
+          account?.status === "active" &&
+          account.authVersion === payload.authVersion,
+      });
+    }
+
+    if (
+      pathname === "/internal/session/logout" &&
+      request.method === "POST"
+    ) {
+      const payload = await request.json<unknown>().catch(() => null);
+      if (!validSessionIdentity(payload)) {
+        return jsonResponse({ error: "Invalid session revocation request." }, 400);
+      }
+      if (payload.role === "admin") {
+        if (payload.subject !== this.env.PANEL_ADMIN_ID) {
+          return jsonResponse({ error: "Session revocation rejected." }, 403);
+        }
+        await this.ctx.storage.transaction(async (transaction) => {
+          const current =
+            (await transaction.get<number>(ADMIN_AUTH_VERSION_KEY)) ?? 0;
+          if (current === payload.authVersion) {
+            await transaction.put(ADMIN_AUTH_VERSION_KEY, current + 1);
+          }
+        });
+      } else {
+        await this.ctx.storage.transaction(async (transaction) => {
+          const key = `account:${payload.accountId}`;
+          const account = await transaction.get<AccountRecord>(key);
+          if (!account) return;
+          const current = Number.isSafeInteger(account.authVersion)
+            ? account.authVersion
+            : 0;
+          if (current === payload.authVersion) {
+            await transaction.put(key, {
+              ...account,
+              authVersion: current + 1,
+              updatedAt: new Date().toISOString(),
+            });
+          }
+        });
+      }
+      return jsonResponse({ revoked: true });
+    }
 
     if (pathname === "/internal/login/check" && request.method === "POST") {
       const payload = await request.json<Record<string, unknown>>().catch(() => null);
@@ -469,6 +618,7 @@ export class DynamicIpRegistry extends DurableObject<Env> {
               username: account.username,
               status: account.status,
               passwordHash: account.passwordHash,
+              authVersion: account.authVersion ?? 0,
             }
           : null,
       });
@@ -493,6 +643,9 @@ export class DynamicIpRegistry extends DurableObject<Env> {
 
     if (pathname === "/internal/accounts" && request.method === "POST") {
       const payload = await request.json<unknown>().catch(() => null);
+      if (!this.env.PANEL_ADMIN_ID) {
+        return jsonResponse({ error: "Account service is not configured." }, 503);
+      }
       if (
         !validAccountCreate(payload) ||
         normalizeUsername(payload.username) ===
@@ -505,6 +658,7 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         username: payload.username.trim(),
         normalizedUsername: normalizeUsername(payload.username),
         passwordHash: payload.passwordHash,
+        authVersion: 0,
         peerId: payload.peerId,
         note: payload.note.trim(),
         status: "active",
@@ -551,9 +705,16 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         const key = `account:${id}`;
         const account = await transaction.get<AccountRecord>(key);
         if (!account) return undefined;
+        const authVersion = Number.isSafeInteger(account.authVersion)
+          ? account.authVersion
+          : 0;
+        const revokeExistingSessions =
+          payload.passwordHash !== undefined ||
+          (payload.status !== undefined && payload.status !== account.status);
         const next: AccountRecord = {
           ...account,
           ...payload,
+          authVersion: authVersion + Number(revokeExistingSessions),
           note: typeof payload.note === "string" ? payload.note.trim() : account.note,
           updatedAt: new Date().toISOString(),
         };

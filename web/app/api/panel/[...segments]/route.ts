@@ -1,7 +1,7 @@
-import { cookies } from "next/headers";
 import { NextResponse } from "next/server";
 import { accountStoreFetch } from "@/lib/account-store";
-import { isSameOrigin, SESSION_COOKIE, verifySessionToken } from "@/lib/session";
+import { getRequestSession } from "@/lib/api-auth";
+import { isSameOrigin } from "@/lib/session";
 
 type RouteContext = { params: Promise<{ segments: string[] }> };
 type Method = "GET" | "POST" | "DELETE";
@@ -181,8 +181,7 @@ async function proxy(
   context: RouteContext,
   method: Method,
 ) {
-  const cookieStore = await cookies();
-  const session = verifySessionToken(cookieStore.get(SESSION_COOKIE)?.value);
+  const session = await getRequestSession();
   if (!session) {
     return NextResponse.json({ error: "Authentication required." }, { status: 401 });
   }

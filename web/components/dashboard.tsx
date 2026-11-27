@@ -333,8 +333,14 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
   }, [refresh]);
 
   async function logout() {
-    await fetch("/api/auth/logout", { method: "POST" });
-    router.replace("/login");
+    let destination = "/login";
+    try {
+      const response = await fetch("/api/auth/logout", { method: "POST" });
+      if (!response.ok) destination = "/login?signout=retry";
+    } catch {
+      destination = "/login?signout=retry";
+    }
+    router.replace(destination);
     router.refresh();
   }
 

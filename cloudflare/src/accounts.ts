@@ -11,6 +11,7 @@ export interface AccountRecord {
   username: string;
   normalizedUsername: string;
   passwordHash: string;
+  authVersion: number;
   peerId: string;
   note: string;
   status: AccountStatus;
@@ -24,7 +25,10 @@ export interface AccountRecord {
   updatedAt: string;
 }
 
-export type PublicAccount = Omit<AccountRecord, "normalizedUsername" | "passwordHash">;
+export type PublicAccount = Omit<
+  AccountRecord,
+  "normalizedUsername" | "passwordHash" | "authVersion"
+>;
 
 export function normalizeUsername(value: string): string {
   return value.trim().toLowerCase();
@@ -42,8 +46,12 @@ export function validScryptHash(value: unknown): value is string {
 }
 
 export function publicAccount(record: AccountRecord): PublicAccount {
-  const { passwordHash: _passwordHash, normalizedUsername: _normalizedUsername, ...result } =
-    record;
+  const {
+    passwordHash: _passwordHash,
+    normalizedUsername: _normalizedUsername,
+    authVersion: _authVersion,
+    ...result
+  } = record;
   return result;
 }
 

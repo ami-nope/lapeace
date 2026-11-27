@@ -16,7 +16,14 @@ export async function POST(request: Request) {
 
   let body: unknown;
   try {
-    body = await request.json();
+    const text = await request.text();
+    if (text.length > 4096) {
+      return NextResponse.json(
+        { error: "Request body is too large." },
+        { status: 413 },
+      );
+    }
+    body = JSON.parse(text);
   } catch (error) {
     if (error instanceof SyntaxError) {
       return NextResponse.json({ error: "Invalid request body." }, { status: 400 });
@@ -75,12 +82,50 @@ export async function POST(request: Request) {
   }
 
   let sessionClaims:
-    | { subject: string; role: "admin" }
-    | { subject: string; role: "user"; accountId: string }
+    | { subject: string; role: "admin"; authVersion: number }
+    | {
+        subject: string;
+        role: "user";
+        accountId: string;
+        authVersion: number;
+      }
     | null = null;
   if (body.adminId === process.env.PANEL_ADMIN_ID) {
     if (verifyAdminCredentials(body.adminId, body.password)) {
-      sessionClaims = { subject: body.adminId, role: "admin" };
+      try {
+        const versionResponse = await accountStoreFetch(
+          "internal/session/admin-version",
+        );
+        if (!versionResponse.ok) {
+          return NextResponse.json(
+            { error: "Authentication service is unavailable." },
+            { status: 503 },
+          );
+        }
+        const versionResult = (await versionResponse.json()) as {
+          authVersion?: unknown;
+        };
+        if (
+          typeof versionResult.authVersion !== "number" ||
+          !Number.isSafeInteger(versionResult.authVersion) ||
+          versionResult.authVersion < 0
+        ) {
+          return NextResponse.json(
+            { error: "Authentication service returned invalid session state." },
+            { status: 503 },
+          );
+        }
+        sessionClaims = {
+          subject: body.adminId,
+          role: "admin",
+          authVersion: versionResult.authVersion,
+        };
+      } catch {
+        return NextResponse.json(
+          { error: "Authentication service is unavailable." },
+          { status: 503 },
+        );
+      }
     }
   } else {
     try {
@@ -95,16 +140,20 @@ export async function POST(request: Request) {
             id: string;
             status: "active" | "suspended";
             passwordHash: string;
+            authVersion: number;
           } | null;
         };
         if (
           result.account?.status === "active" &&
+          Number.isSafeInteger(result.account.authVersion) &&
+          result.account.authVersion >= 0 &&
           verifyScryptPassword(body.password, result.account.passwordHash)
         ) {
           sessionClaims = {
             subject: result.account.id,
             role: "user",
             accountId: result.account.id,
+            authVersion: result.account.authVersion,
           };
         }
       } else if (lookupResponse.status !== 400) {

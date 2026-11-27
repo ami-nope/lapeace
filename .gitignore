@@ -19,3 +19,4 @@ __pycache__/
 *.key
 agent/state.json
 cloudflare/.dev.vars*
+env.md

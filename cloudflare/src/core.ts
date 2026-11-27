@@ -21,6 +21,7 @@ export interface SessionClaims {
   subject: string;
   role: "admin" | "user";
   accountId?: string;
+  authVersion: number;
   expiresAt: number;
 }
 
@@ -80,10 +81,14 @@ function cookieValue(request: Request, name: string): string | null {
 
 export async function readSessionClaims(
   request: Request,
-  env: { PANEL_ADMIN_ID: string; PANEL_SESSION_SECRET: string },
+  env: {
+    PANEL_ADMIN_ID?: string;
+    PANEL_SESSION_SECRET?: string;
+  },
 ): Promise<SessionClaims | null> {
   if (
     !env.PANEL_ADMIN_ID ||
+    !env.PANEL_SESSION_SECRET ||
     new TextEncoder().encode(env.PANEL_SESSION_SECRET).length < 32
   ) {
     return null;
@@ -107,24 +112,16 @@ export async function readSessionClaims(
     return null;
   }
   const parts = decoded.split("\n");
-  if (parts.length === 2) {
-    const expiresAt = Number(parts[1]);
-    if (
-      parts[0] === env.PANEL_ADMIN_ID &&
-      Number.isSafeInteger(expiresAt) &&
-      expiresAt > Math.floor(Date.now() / 1000)
-    ) {
-      return { subject: parts[0], role: "admin", expiresAt };
-    }
-    return null;
-  }
-  if (parts.length !== 5 || parts[0] !== "v2") return null;
+  if (parts.length !== 6 || parts[0] !== "v3") return null;
 
-  const [, subject, role, accountId, expiresAtText] = parts;
+  const [, subject, role, accountId, authVersionText, expiresAtText] = parts;
+  const authVersion = Number(authVersionText);
   const expiresAt = Number(expiresAtText);
   if (
     !subject ||
     (role !== "admin" && role !== "user") ||
+    !Number.isSafeInteger(authVersion) ||
+    authVersion < 0 ||
     !Number.isSafeInteger(expiresAt) ||
     expiresAt <= Math.floor(Date.now() / 1000)
   ) {
@@ -132,18 +129,27 @@ export async function readSessionClaims(
   }
   if (role === "admin") {
     return subject === env.PANEL_ADMIN_ID && accountId === ""
-      ? { subject, role, expiresAt }
+      ? { subject, role, authVersion, expiresAt }
       : null;
   }
-  return accountId ? { subject, role, accountId, expiresAt } : null;
+  return accountId && subject === accountId
+    ? { subject, role, accountId, authVersion, expiresAt }
+    : null;
 }
 
 export async function verifyAdminSession(
   request: Request,
-  env: { PANEL_ADMIN_ID: string; PANEL_SESSION_SECRET: string },
+  env: {
+    PANEL_ADMIN_ID?: string;
+    PANEL_SESSION_SECRET?: string;
+  },
 ): Promise<boolean> {
   const claims = await readSessionClaims(request, env);
-  return claims?.role === "admin" && claims.subject === env.PANEL_ADMIN_ID;
+  return Boolean(
+    claims?.role === "admin" &&
+      env.PANEL_ADMIN_ID &&
+      claims.subject === env.PANEL_ADMIN_ID,
+  );
 }
 
 export function isPublicIpv4(value: string): boolean {

@@ -7,6 +7,7 @@ export interface SessionClaims {
   subject: string;
   role: "admin" | "user";
   accountId?: string;
+  authVersion: number;
   expiresAt: number;
 }
 
@@ -78,20 +79,31 @@ export function hashPassword(password: string): string {
 }
 
 export function createSessionToken(
-  claims: Pick<SessionClaims, "subject" | "role"> & { accountId?: string },
+  claims: Pick<SessionClaims, "subject" | "role" | "authVersion"> & {
+    accountId?: string;
+  },
 ): string | null {
   const secret = sessionSecret();
-  if (!secret || !claims.subject) return null;
+  if (
+    !secret ||
+    !claims.subject ||
+    !Number.isSafeInteger(claims.authVersion) ||
+    claims.authVersion < 0
+  ) {
+    return null;
+  }
   if (
     (claims.role === "admin" && claims.subject !== process.env.PANEL_ADMIN_ID) ||
-    (claims.role === "user" && !claims.accountId)
+    (claims.role === "admin" && claims.accountId !== undefined) ||
+    (claims.role === "user" &&
+      (!claims.accountId || claims.subject !== claims.accountId))
   ) {
     return null;
   }
 
   const expiresAt = Math.floor(Date.now() / 1000) + SESSION_SECONDS;
   const payload = Buffer.from(
-    `v2\n${claims.subject}\n${claims.role}\n${claims.accountId ?? ""}\n${expiresAt}`,
+    `v3\n${claims.subject}\n${claims.role}\n${claims.accountId ?? ""}\n${claims.authVersion}\n${expiresAt}`,
   ).toString("base64url");
   return `${payload}.${sign(payload, secret)}`;
 }
@@ -111,12 +123,15 @@ export function verifySessionToken(token: string | undefined): SessionClaims | n
     return null;
   }
   const parts = decoded.split("\n");
-  if (parts.length !== 5 || parts[0] !== "v2") return null;
-  const [, subject, role, accountId, expiresAtText] = parts;
+  if (parts.length !== 6 || parts[0] !== "v3") return null;
+  const [, subject, role, accountId, authVersionText, expiresAtText] = parts;
+  const authVersion = Number(authVersionText);
   const expiresAt = Number(expiresAtText);
   if (
     !subject ||
     (role !== "admin" && role !== "user") ||
+    !Number.isSafeInteger(authVersion) ||
+    authVersion < 0 ||
     !Number.isSafeInteger(expiresAt) ||
     expiresAt <= Math.floor(Date.now() / 1000)
   ) {
@@ -124,10 +139,12 @@ export function verifySessionToken(token: string | undefined): SessionClaims | n
   }
   if (role === "admin") {
     return subject === process.env.PANEL_ADMIN_ID && accountId === ""
-      ? { subject, role, expiresAt }
+      ? { subject, role, authVersion, expiresAt }
       : null;
   }
-  return accountId ? { subject, role, accountId, expiresAt } : null;
+  return accountId && subject === accountId
+    ? { subject, role, accountId, authVersion, expiresAt }
+    : null;
 }
 
 export { SESSION_SECONDS };
