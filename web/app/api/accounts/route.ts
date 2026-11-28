@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { AgentUsageError, baselineForPeer, getAgentUsageSnapshot } from "@/lib/agent-usage";
 import { accountStoreFetch } from "@/lib/account-store";
 import { getRequestSession } from "@/lib/api-auth";
 import { isSameOrigin, hashPassword } from "@/lib/session";
@@ -74,9 +75,12 @@ export async function POST(request: Request) {
 
   const { password, ...details } = payload;
   try {
+    const snapshot = await getAgentUsageSnapshot();
+    const assignmentBaseline = baselineForPeer(snapshot, payload.peerId);
     const response = await accountStoreFetch("internal/accounts", "POST", {
       ...details,
       passwordHash: hashPassword(password),
+      assignmentBaseline,
     });
     return new Response(await response.arrayBuffer(), {
       status: response.status,
@@ -85,7 +89,10 @@ export async function POST(request: Request) {
         "Cache-Control": "no-store",
       },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof AgentUsageError) {
+      return jsonResponse({ error: error.message }, error.status);
+    }
     return jsonResponse({ error: "Account store is unavailable." }, 503);
   }
 }

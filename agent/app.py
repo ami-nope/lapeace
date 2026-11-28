@@ -19,7 +19,7 @@ from dynamic_ssh import dynamic_sync_loop
 
 INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 FINGERPRINT_BYTES = 8
-HISTORY_DAYS = 14
+HISTORY_DAYS = 31
 IST = ZoneInfo("Asia/Kolkata")
 
 @asynccontextmanager
@@ -285,6 +285,8 @@ def _peer_output(record: dict[str, Any]) -> dict[str, Any]:
         "txBps": download_mbps * 1_000_000 / 8,
         "handshakeAt": _handshake_timestamp(record["latest_handshake"]),
         "todayBytes": daily_upload_bytes + daily_download_bytes,
+        "dailyUploadBytes": daily_upload_bytes,
+        "dailyDownloadBytes": daily_download_bytes,
     }
 
 
@@ -305,8 +307,11 @@ def _usage_counts(value: Any) -> tuple[int, int]:
     )
 
 
-def _history(daily_usage: dict[str, Any]) -> list[dict[str, Any]]:
-    totals: dict[str, dict[str, int]] = {}
+def _peer_usage_history(
+    daily_usage: dict[str, Any],
+) -> tuple[dict[str, dict[str, dict[str, int]]], set[str]]:
+    usage_by_peer: dict[str, dict[str, dict[str, int]]] = {}
+    dates: set[str] = set()
     for outer_key, outer_value in daily_usage.items():
         if not isinstance(outer_key, str) or not isinstance(outer_value, dict):
             raise ValueError("Monitor daily usage has an invalid entry.")
@@ -317,37 +322,83 @@ def _history(daily_usage: dict[str, Any]) -> list[dict[str, Any]]:
         except ValueError:
             is_date_key = False
 
-        entries = (
-            [(outer_key, peer_usage) for peer_usage in outer_value.values()]
-            if is_date_key
-            else [
-                (day, usage)
+        if is_date_key:
+            entries = [
+                (peer_key, outer_key, usage)
+                for peer_key, usage in outer_value.items()
+            ]
+        else:
+            entries = [
+                (outer_key, day, usage)
                 for day, usage in outer_value.items()
                 if isinstance(day, str)
             ]
-        )
-        for day, usage in entries:
+
+        for public_key, day, usage in entries:
             try:
                 date.fromisoformat(day)
             except ValueError as error:
                 if is_date_key:
                     raise ValueError("Monitor daily usage contains an invalid date.") from error
                 continue
+            if not isinstance(public_key, str):
+                raise ValueError("Monitor daily usage contains an invalid peer key.")
+            fingerprint(public_key)
             upload, download = _usage_counts(usage)
-            day_total = totals.setdefault(day, {"rxBytes": 0, "txBytes": 0})
-            day_total["rxBytes"] += upload
-            day_total["txBytes"] += download
+            dates.add(day)
+            peer_id = hashlib.sha256(public_key.encode("utf-8")).hexdigest()
+            usage_by_peer.setdefault(peer_id, {})[day] = {
+                "uploadBytes": upload,
+                "downloadBytes": download,
+            }
+    return usage_by_peer, dates
 
-    days = sorted(totals)[-HISTORY_DAYS:]
-    return [{"date": day, **totals[day]} for day in days]
+
+def _history(
+    usage_by_peer: dict[str, dict[str, dict[str, int]]],
+    dates: set[str],
+) -> list[dict[str, Any]]:
+    days = sorted(dates)[-HISTORY_DAYS:]
+    result: list[dict[str, Any]] = []
+    for day in days:
+        result.append({
+            "date": day,
+            "rxBytes": sum(
+                peer_days.get(day, {}).get("uploadBytes", 0)
+                for peer_days in usage_by_peer.values()
+            ),
+            "txBytes": sum(
+                peer_days.get(day, {}).get("downloadBytes", 0)
+                for peer_days in usage_by_peer.values()
+            ),
+        })
+    return result
 
 
 def build_dashboard_snapshot(document: dict[str, Any], interface_name: str) -> dict[str, Any]:
     try:
         source_peers = _snapshot_records(document["snapshot"])
         peers = [_peer_output(record) for record in source_peers]
-        history = _history(document["daily_usage"])
         sampled_at = _sample_time(document["last_sample"])
+        usage_by_peer, history_dates = _peer_usage_history(document["daily_usage"])
+        sampled_date = datetime.fromisoformat(sampled_at).astimezone(IST).date().isoformat()
+        if source_peers:
+            history_dates.add(sampled_date)
+        for peer, record in zip(peers, source_peers):
+            peer_days = usage_by_peer.setdefault(peer["id"], {})
+            peer_days[sampled_date] = {
+                "uploadBytes": peer["dailyUploadBytes"],
+                "downloadBytes": peer["dailyDownloadBytes"],
+            }
+            peer["usageHistory"] = [
+                {
+                    "date": day,
+                    **peer_days[day],
+                }
+                for day in sorted(history_dates)[-HISTORY_DAYS:]
+                if day in peer_days
+            ]
+        history = _history(usage_by_peer, history_dates)
     except (KeyError, TypeError, ValueError, OverflowError) as error:
         raise HTTPException(
             status_code=503, detail="Monitor state contains invalid telemetry."
@@ -365,6 +416,8 @@ def build_dashboard_snapshot(document: dict[str, Any], interface_name: str) -> d
         "interface": interface,
         "sampledAt": sampled_at,
         "peers": peers,
+        "historyStartDate": history[0]["date"] if history else None,
+        "historyEndDate": history[-1]["date"] if history else None,
         "history": history,
     }
 

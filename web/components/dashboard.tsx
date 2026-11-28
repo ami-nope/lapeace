@@ -83,10 +83,18 @@ type DynamicSSHData = {
 
 type UserSummary = {
   sampledAt: string;
+  todayUploadBytes: number;
+  todayDownloadBytes: number;
   todayBytes: number;
+  monthlyUploadBytes: number;
+  monthlyDownloadBytes: number;
+  monthlyBytes: number;
   uploadBps: number;
   downloadBps: number;
   dailyQuotaBytes: number | null;
+  dailyRemainingBytes: number | null;
+  monthlyQuotaBytes: number | null;
+  monthlyRemainingBytes: number | null;
 };
 
 function formatTimestamp(value: string | null | undefined): string {
@@ -95,10 +103,20 @@ function formatTimestamp(value: string | null | undefined): string {
   return Number.isNaN(timestamp.getTime()) ? "—" : timestamp.toLocaleString();
 }
 
+function formatIstTimestamp(value: string): string {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return "—";
+  return `${new Intl.DateTimeFormat("en-IN", {
+    dateStyle: "medium",
+    timeStyle: "medium",
+    timeZone: "Asia/Kolkata",
+  }).format(timestamp)} IST`;
+}
+
 function formatBytes(bytes: number | null | undefined): string {
   if (bytes == null || !Number.isFinite(bytes)) return "—";
   if (bytes < 1024) return `${bytes} B`;
-  const units = ["KB", "MB", "GB", "TB"];
+  const units = ["KiB", "MiB", "GiB", "TiB"];
   let value = bytes / 1024;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {
@@ -349,11 +367,14 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
 
   if (role === "user") {
     const dailyQuota = userSummary?.dailyQuotaBytes ?? null;
-    const remaining = dailyQuota === null
-      ? null
-      : Math.max(0, dailyQuota - (userSummary?.todayBytes ?? 0));
+    const monthlyQuota = userSummary?.monthlyQuotaBytes ?? null;
+    const dailyRemaining = userSummary?.dailyRemainingBytes ?? null;
+    const monthlyRemaining = userSummary?.monthlyRemainingBytes ?? null;
     const quotaPercent = dailyQuota && dailyQuota > 0
       ? Math.min(100, ((userSummary?.todayBytes ?? 0) / dailyQuota) * 100)
+      : 0;
+    const monthlyQuotaPercent = monthlyQuota && monthlyQuota > 0
+      ? Math.min(100, ((userSummary?.monthlyBytes ?? 0) / monthlyQuota) * 100)
       : 0;
     return (
       <main className="min-h-screen bg-[#090d0a] px-3 py-5 sm:px-6">
@@ -363,7 +384,7 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
               <p className="text-[11px] tracking-[0.12em] text-[#c5d5c7]">
                 <span className="text-[#65d98a]">AMII</span> // PRIVATE LINK
               </p>
-              <p className="mt-1 text-[9px] text-[#718276]">DAILY USAGE CONSOLE</p>
+              <p className="mt-1 text-[9px] text-[#718276]">USAGE CONSOLE · IST</p>
             </div>
             <Button onClick={() => void logout()} size="small" variant="quiet">
               <LogOut className="h-3 w-3" aria-hidden="true" /> SIGN OUT
@@ -380,7 +401,7 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
             </p>
           </section>
 
-          <div className="grid gap-3 md:grid-cols-3">
+          <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
             <Metric
               label="Data used today"
               value={formatBytes(userSummary?.todayBytes)}
@@ -388,54 +409,92 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
               icon={HardDrive}
             />
             <Metric
-              label="Current upload"
-              value={formatRate(userSummary?.uploadBps)}
-              detail="LIVE RATE"
+              label="Uploaded today"
+              value={formatBytes(userSummary?.todayUploadBytes)}
+              detail={`CURRENT RATE ${formatRate(userSummary?.uploadBps)}`}
               icon={ArrowUpFromLine}
             />
             <Metric
-              label="Current download"
-              value={formatRate(userSummary?.downloadBps)}
-              detail="LIVE RATE"
+              label="Downloaded today"
+              value={formatBytes(userSummary?.todayDownloadBytes)}
+              detail={`CURRENT RATE ${formatRate(userSummary?.downloadBps)}`}
               icon={ArrowDownToLine}
               accent="text-[#d8a64e]"
+            />
+            <Metric
+              label="Data used this month"
+              value={formatBytes(userSummary?.monthlyBytes)}
+              detail="UPLOAD + DOWNLOAD · IST MONTH"
+              icon={Activity}
             />
           </div>
 
           <section className="panel p-4">
-            <div className="flex flex-wrap items-end justify-between gap-2">
+            <div className="grid gap-5 md:grid-cols-2">
               <div>
-                <p className="mono-label">Today’s quota</p>
-                <p className="mt-1 text-sm text-[#c5d5c7]">
-                  {dailyQuota === null
-                    ? `${formatBytes(userSummary?.todayBytes)} USED · NO DAILY CAP`
-                    : `${formatBytes(userSummary?.todayBytes)} USED · ${formatBytes(remaining)} REMAINING`}
-                </p>
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <p className="mono-label">Today’s quota</p>
+                    <p className="mt-1 text-sm text-[#c5d5c7]">
+                      {!userSummary
+                        ? "USAGE UNAVAILABLE"
+                        : dailyQuota === null
+                        ? `${formatBytes(userSummary?.todayBytes)} USED · NO DAILY CAP`
+                        : `${formatBytes(userSummary?.todayBytes)} USED · ${formatBytes(dailyRemaining)} REMAINING`}
+                    </p>
+                  </div>
+                  {userSummary && dailyQuota !== null && (
+                    <p className="text-[10px] text-[#718276]">LIMIT {formatBytes(dailyQuota)}</p>
+                  )}
+                </div>
+                {dailyQuota !== null && (
+                  <div
+                    aria-label={`Daily usage ${Math.round(quotaPercent)} percent`}
+                    aria-valuemax={100}
+                    aria-valuemin={0}
+                    aria-valuenow={Math.round(quotaPercent)}
+                    className="mt-3 h-2 border border-[#26382b] bg-[#090d0a]"
+                    role="progressbar"
+                  >
+                    <div className="h-full bg-[#65d98a]" style={{ width: `${quotaPercent}%` }} />
+                  </div>
+                )}
               </div>
-              {dailyQuota !== null && (
-                <p className="text-[10px] text-[#718276]">LIMIT {formatBytes(dailyQuota)}</p>
-              )}
+              <div>
+                <div className="flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <p className="mono-label">Monthly quota</p>
+                    <p className="mt-1 text-sm text-[#c5d5c7]">
+                      {!userSummary
+                        ? "USAGE UNAVAILABLE"
+                        : monthlyQuota === null
+                        ? `${formatBytes(userSummary?.monthlyBytes)} USED · NO MONTHLY CAP`
+                        : `${formatBytes(userSummary?.monthlyBytes)} USED · ${formatBytes(monthlyRemaining)} REMAINING`}
+                    </p>
+                  </div>
+                  {userSummary && monthlyQuota !== null && (
+                    <p className="text-[10px] text-[#718276]">LIMIT {formatBytes(monthlyQuota)}</p>
+                  )}
+                </div>
+                {monthlyQuota !== null && (
+                  <div
+                    aria-label={`Monthly usage ${Math.round(monthlyQuotaPercent)} percent`}
+                    aria-valuemax={100}
+                    aria-valuemin={0}
+                    aria-valuenow={Math.round(monthlyQuotaPercent)}
+                    className="mt-3 h-2 border border-[#26382b] bg-[#090d0a]"
+                    role="progressbar"
+                  >
+                    <div className="h-full bg-[#65d98a]" style={{ width: `${monthlyQuotaPercent}%` }} />
+                  </div>
+                )}
+              </div>
             </div>
-            {dailyQuota !== null && (
-              <div
-                aria-label={`Daily usage ${Math.round(quotaPercent)} percent`}
-                aria-valuemax={100}
-                aria-valuemin={0}
-                aria-valuenow={Math.round(quotaPercent)}
-                className="mt-3 h-2 border border-[#26382b] bg-[#090d0a]"
-                role="progressbar"
-              >
-                <div
-                  className="h-full bg-[#65d98a]"
-                  style={{ width: `${quotaPercent}%` }}
-                />
-              </div>
-            )}
             <p className="mt-3 text-[9px] text-[#718276]">
               Usage and limits are informational; this portal does not throttle or disconnect your VPN.
             </p>
             <p className="mt-2 text-[9px] text-[#718276]">
-              LAST SAMPLE {formatTimestamp(userSummary?.sampledAt)}
+              LAST TELEMETRY SAMPLE {userSummary ? formatIstTimestamp(userSummary.sampledAt) : "UNAVAILABLE"}
             </p>
           </section>
         </div>

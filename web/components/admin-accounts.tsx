@@ -19,6 +19,7 @@ type AuditResult = {
 type AccountEditor = {
   id: string;
   username: string;
+  peerId: string;
   note: string;
   dailyQuota: string;
   monthlyQuota: string;
@@ -139,6 +140,7 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
       setNotice("Account created. The password is stored as a one-way hash.");
       setUsername("");
       setPassword("");
+      setPeerId("");
       setNote("");
       setDailyQuota("");
       setMonthlyQuota("");
@@ -186,6 +188,7 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
     setEditing({
       id: account.id,
       username: account.username,
+      peerId: account.peerId,
       note: account.note,
       dailyQuota: quotaInput(account.dailyQuotaBytes),
       monthlyQuota: quotaInput(account.monthlyQuotaBytes),
@@ -212,6 +215,9 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
     setBusy(true);
     const body = {
       note: editing.note,
+      ...(editing.peerId !== accounts.find((account) => account.id === editing.id)?.peerId
+        ? { peerId: editing.peerId }
+        : {}),
       dailyQuotaBytes: bytesFromGiB(editing.dailyQuota),
       monthlyQuotaBytes: bytesFromGiB(editing.monthlyQuota),
       uploadLimitMbps: editing.uploadLimit ? Number(editing.uploadLimit) : null,
@@ -366,6 +372,40 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
                 </button>
               </div>
               <label className="block">
+                <span className="mono-label mb-1 block">Assigned existing peer</span>
+                <select
+                  className="h-8 w-full border border-[#354839] bg-[#090d0a] px-2 text-[10px] outline-none focus:border-[#65d98a]"
+                  onChange={(event) =>
+                    setEditing({ ...editing, peerId: event.target.value })
+                  }
+                  required
+                  value={editing.peerId}
+                >
+                  {!peers.some((peer) => peer.id === editing.peerId) && (
+                    <option value={editing.peerId}>
+                      CURRENT PEER · {editing.peerId.slice(0, 12)} (TELEMETRY UNAVAILABLE)
+                    </option>
+                  )}
+                  {peers
+                    .filter(
+                      (peer) =>
+                        peer.id === editing.peerId ||
+                        !accounts.some(
+                          (account) =>
+                            account.id !== editing.id && account.peerId === peer.id,
+                        ),
+                    )
+                    .map((peer) => (
+                      <option key={peer.id} value={peer.id}>
+                        {peer.allowedIps.join(", ") || peer.fingerprint}
+                      </option>
+                    ))}
+                </select>
+                <span className="mt-1 block text-[9px] text-[#718276]">
+                  Changing peers starts a new usage-accounting period.
+                </span>
+              </label>
+              <label className="block">
                 <span className="mono-label mb-1 block">Admin note</span>
                 <input
                   className="h-8 w-full border border-[#354839] bg-[#090d0a] px-2 text-[10px] outline-none focus:border-[#65d98a]"
@@ -514,11 +554,13 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
               value={peerId}
             >
               <option value="">SELECT PEER</option>
-              {peers.map((peer) => (
+              {peers
+                .filter((peer) => !accounts.some((account) => account.peerId === peer.id))
+                .map((peer) => (
                 <option key={peer.id} value={peer.id}>
                   {peer.allowedIps.join(", ") || peer.fingerprint}
                 </option>
-              ))}
+                ))}
             </select>
           </label>
           <label className="block">

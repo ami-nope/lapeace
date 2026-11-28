@@ -1,4 +1,5 @@
 import base64
+from datetime import date, timedelta
 import json
 
 import pytest
@@ -134,6 +135,15 @@ def test_adapter_maps_multiple_peers_without_reversing_directions_and_does_not_w
     assert first["rxBps"] == pytest.approx(100_000)
     assert first["txBps"] == pytest.approx(200_000)
     assert first["todayBytes"] == 240
+    assert first["dailyUploadBytes"] == 80
+    assert first["dailyDownloadBytes"] == 160
+    assert first["usageHistory"] == [
+        {
+            "date": IST_DATE,
+            "uploadBytes": 80,
+            "downloadBytes": 160,
+        }
+    ]
     assert first["handshakeAt"] == 1795780800
     assert first["status"] == "connected"
     assert second["rxBytes"] == 240
@@ -145,6 +155,8 @@ def test_adapter_maps_multiple_peers_without_reversing_directions_and_does_not_w
     assert result["history"] == [
         {"date": IST_DATE, "rxBytes": 104, "txBytes": 208}
     ]
+    assert result["historyStartDate"] == IST_DATE
+    assert result["historyEndDate"] == IST_DATE
     assert public_key(12) not in response.text
     assert "must-not-be-exposed" not in response.text
     assert "198.51.100.10" not in response.text
@@ -219,6 +231,40 @@ def test_daily_usage_accepts_peer_keyed_history(tmp_path, monkeypatch):
         {"date": "2026-11-26", "rxBytes": 40, "txBytes": 60},
         {"date": IST_DATE, "rxBytes": 80, "txBytes": 160},
     ]
+
+
+def test_snapshot_exposes_per_peer_month_history_without_public_keys(
+    tmp_path, monkeypatch
+):
+    peer = peer_snapshot(12, daily_upload=999, daily_download=300)
+    document = monitor_document([peer])
+    start = date.fromisoformat(IST_DATE) - timedelta(days=34)
+    document["daily_usage"] = {
+        peer["public_key"]: {
+            (start + timedelta(days=offset)).isoformat(): {
+                "upload_bytes": offset,
+                "download_bytes": offset * 2,
+            }
+            for offset in range(35)
+        }
+    }
+    path = tmp_path / "usage.json"
+    path.write_text(json.dumps(document), encoding="utf-8")
+    client, headers = authenticated_client(monkeypatch, path)
+
+    response = client.get("/api/v1/snapshot", headers=headers)
+
+    assert response.status_code == 200
+    result = response.json()
+    assert result["historyStartDate"] == "2026-10-28"
+    assert result["historyEndDate"] == IST_DATE
+    assert len(result["peers"][0]["usageHistory"]) == 31
+    assert result["peers"][0]["usageHistory"][-1] == {
+        "date": IST_DATE,
+        "uploadBytes": 999,
+        "downloadBytes": 300,
+    }
+    assert peer["public_key"] not in response.text
 
 
 def test_agent_operations_require_auth_and_mutations_stay_disabled(monkeypatch):

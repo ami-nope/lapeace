@@ -1,52 +1,16 @@
 import { NextResponse } from "next/server";
+import { AgentUsageError, baselineForPeer, getAgentUsageSnapshot } from "@/lib/agent-usage";
 import { accountStoreFetch } from "@/lib/account-store";
 import { getRequestSession } from "@/lib/api-auth";
 import { isSameOrigin } from "@/lib/session";
+import {
+  calculateAccountUsage,
+  isUsageAssignment,
+  UsageTelemetryUnavailableError,
+} from "@/lib/usage-accounting";
 
 type RouteContext = { params: Promise<{ segments: string[] }> };
 type Method = "GET" | "POST" | "DELETE";
-
-type UserSnapshot = {
-  sampledAt: string;
-  peers: Array<{
-    id: string;
-    todayBytes: number;
-    rxBps: number;
-    txBps: number;
-  }>;
-};
-
-function isUserSnapshot(value: unknown): value is UserSnapshot {
-  if (
-    typeof value !== "object" ||
-    value === null ||
-    !("sampledAt" in value) ||
-    typeof value.sampledAt !== "string" ||
-    !("peers" in value) ||
-    !Array.isArray(value.peers)
-  ) {
-    return false;
-  }
-  return value.peers.every(
-    (peer) =>
-      typeof peer === "object" &&
-      peer !== null &&
-      "id" in peer &&
-      typeof peer.id === "string" &&
-      "todayBytes" in peer &&
-      typeof peer.todayBytes === "number" &&
-      Number.isFinite(peer.todayBytes) &&
-      peer.todayBytes >= 0 &&
-      "rxBps" in peer &&
-      typeof peer.rxBps === "number" &&
-      Number.isFinite(peer.rxBps) &&
-      peer.rxBps >= 0 &&
-      "txBps" in peer &&
-      typeof peer.txBps === "number" &&
-      Number.isFinite(peer.txBps) &&
-      peer.txBps >= 0,
-  );
-}
 
 function isAllowed(method: Method, segments: string[]): boolean {
   const path = segments.join("/");
@@ -88,92 +52,90 @@ async function userSummary(accountId: string): Promise<Response> {
       status: "active" | "suspended";
       peerId: string;
       dailyQuotaBytes: number | null;
+      monthlyQuotaBytes: number | null;
+      usageAssignments: unknown;
     };
   };
   if (accountResult.account.status !== "active") {
     return NextResponse.json({ error: "Account is unavailable." }, { status: 401 });
   }
 
-  const baseUrl = process.env.AGENT_BASE_URL;
-  const apiToken = process.env.AGENT_API_TOKEN;
-  if (!baseUrl || !apiToken) {
-    return NextResponse.json(
-      { error: "The VPS agent is not configured." },
-      { status: 503 },
-    );
-  }
-  let target: URL;
+  let snapshot;
   try {
-    target = new URL("/api/v1/snapshot", baseUrl);
-  } catch {
-    return NextResponse.json(
-      { error: "The VPS agent address is invalid." },
-      { status: 503 },
-    );
-  }
-  if (
-    target.protocol !== "https:" &&
-    target.hostname !== "localhost" &&
-    target.hostname !== "127.0.0.1"
-  ) {
-    return NextResponse.json(
-      { error: "The VPS agent must use HTTPS." },
-      { status: 503 },
-    );
-  }
-
-  let upstream: Response;
-  try {
-    upstream = await fetch(target, {
-      headers: { Authorization: `Bearer ${apiToken}` },
-      cache: "no-store",
-      signal: AbortSignal.timeout(7_000),
-    });
+    snapshot = await getAgentUsageSnapshot();
   } catch (error) {
-    if (error instanceof TypeError || error instanceof DOMException) {
+    if (error instanceof AgentUsageError) {
       return NextResponse.json(
-        { error: "The VPS agent could not be reached." },
-        { status: 502 },
+        { error: error.message },
+        { status: error.status, headers: { "Cache-Control": "no-store" } },
       );
     }
     throw error;
   }
-  if (!upstream.ok) {
+
+  let assignments: unknown = accountResult.account.usageAssignments;
+  if (!Array.isArray(assignments) || !assignments.every(isUsageAssignment)) {
     return NextResponse.json(
-      { error: "The VPS agent returned an error." },
-      { status: upstream.status },
+      { error: "Account assignment data is invalid." },
+      { status: 503, headers: { "Cache-Control": "no-store" } },
     );
   }
-
-  let snapshot: UserSnapshot;
-  try {
-    const payload: unknown = await upstream.json();
-    if (!isUserSnapshot(payload)) {
+  if (assignments.length === 0) {
+    let baseline;
+    try {
+      baseline = baselineForPeer(snapshot, accountResult.account.peerId);
+      const migration = await accountStoreFetch(
+        "internal/profile/assignment-baseline",
+        "POST",
+        { id: accountId, baseline },
+      );
+      if (!migration.ok) {
+        return NextResponse.json(
+          { error: "Could not initialize account usage tracking." },
+          { status: 503, headers: { "Cache-Control": "no-store" } },
+        );
+      }
+      const migrated = (await migration.json()) as { usageAssignments?: unknown };
+      assignments = migrated.usageAssignments;
+    } catch (error) {
+      if (error instanceof AgentUsageError) {
+        return NextResponse.json(
+          { error: error.message },
+          { status: error.status, headers: { "Cache-Control": "no-store" } },
+        );
+      }
       return NextResponse.json(
-        { error: "The VPS agent returned invalid telemetry." },
-        { status: 502, headers: { "Cache-Control": "no-store" } },
+        { error: "Could not initialize account usage tracking." },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
       );
     }
-    snapshot = payload;
-  } catch {
-    return NextResponse.json(
-      { error: "The VPS agent returned invalid telemetry." },
-      { status: 502, headers: { "Cache-Control": "no-store" } },
-    );
+    if (!Array.isArray(assignments) || !assignments.every(isUsageAssignment)) {
+      return NextResponse.json(
+        { error: "Account assignment data is invalid." },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      );
+    }
   }
-  const peer = snapshot.peers.find(
-    (record) => record.id === accountResult.account.peerId,
-  );
-  return NextResponse.json(
-    {
-      sampledAt: snapshot.sampledAt,
-      todayBytes: peer?.todayBytes ?? 0,
-      uploadBps: peer?.rxBps ?? 0,
-      downloadBps: peer?.txBps ?? 0,
+
+  try {
+    const usage = calculateAccountUsage({
+      assignments,
+      snapshot,
       dailyQuotaBytes: accountResult.account.dailyQuotaBytes,
-    },
-    { headers: { "Cache-Control": "no-store" } },
-  );
+      monthlyQuotaBytes: accountResult.account.monthlyQuotaBytes,
+    });
+    return NextResponse.json(usage, {
+      headers: { "Cache-Control": "no-store" },
+    });
+  } catch (error) {
+    if (error instanceof UsageTelemetryUnavailableError) {
+      return NextResponse.json(
+        { error: error.message },
+        { status: 503, headers: { "Cache-Control": "no-store" } },
+      );
+    }
+    throw error;
+  }
 }
 
 async function proxy(

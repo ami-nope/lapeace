@@ -1,4 +1,5 @@
 import { NextResponse } from "next/server";
+import { AgentUsageError, baselineForPeer, getAgentUsageSnapshot } from "@/lib/agent-usage";
 import { accountStoreFetch } from "@/lib/account-store";
 import { getRequestSession } from "@/lib/api-auth";
 import { isSameOrigin, hashPassword } from "@/lib/session";
@@ -50,6 +51,46 @@ export async function PATCH(request: Request, context: RouteContext) {
     return jsonResponse({ error: "Account not found." }, 404);
   }
   try {
+    if ("peerId" in updates) {
+      if (
+        typeof updates.peerId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(updates.peerId)
+      ) {
+        return jsonResponse({ error: "Invalid peer assignment." }, 400);
+      }
+      const profileResponse = await accountStoreFetch(
+        `internal/profile?id=${encodeURIComponent(accountId)}`,
+      );
+      if (!profileResponse.ok) {
+        return jsonResponse({ error: "Account is unavailable." }, 404);
+      }
+      const profile = (await profileResponse.json()) as {
+        account?: { peerId?: unknown };
+      };
+      const currentPeerId = profile.account?.peerId;
+      if (
+        typeof currentPeerId !== "string" ||
+        !/^[a-f0-9]{64}$/.test(currentPeerId)
+      ) {
+        return jsonResponse({ error: "Account assignment data is invalid." }, 503);
+      }
+      if (updates.peerId === currentPeerId) {
+        delete updates.peerId;
+      } else {
+        const snapshot = await getAgentUsageSnapshot();
+        const previous = baselineForPeer(snapshot, currentPeerId);
+        const next = baselineForPeer(snapshot, updates.peerId);
+        Object.assign(updates, {
+          assignmentBoundary: {
+            sampledAt: snapshot.sampledAt,
+            previousUploadBytes: previous.uploadBytes,
+            previousDownloadBytes: previous.downloadBytes,
+            nextUploadBytes: next.uploadBytes,
+            nextDownloadBytes: next.downloadBytes,
+          },
+        });
+      }
+    }
     const response = await accountStoreFetch(
       `internal/accounts/${encodeURIComponent(accountId)}`,
       "PATCH",
@@ -62,7 +103,10 @@ export async function PATCH(request: Request, context: RouteContext) {
         "Cache-Control": "no-store",
       },
     });
-  } catch {
+  } catch (error) {
+    if (error instanceof AgentUsageError) {
+      return jsonResponse({ error: error.message }, error.status);
+    }
     return jsonResponse({ error: "Account store is unavailable." }, 503);
   }
 }
