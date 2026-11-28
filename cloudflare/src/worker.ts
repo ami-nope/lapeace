@@ -1,13 +1,19 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   normalizeUsername,
+  isPeerAssignedToAnotherAccount,
   publicAccount,
+  reassignUsagePeriods,
   validAccessWindow,
+  validAssignmentBoundary,
   validOptionalInteger,
   validOptionalRate,
   validScryptHash,
+  validUsageBaseline,
   validUsername,
+  type AssignmentBoundary,
   type AccountRecord,
+  type UsageBaseline,
 } from "./accounts";
 import {
   isExpired,
@@ -135,6 +141,7 @@ function validAccountCreate(
   downloadLimitMbps: number | null;
   maxConcurrentConnections: number | null;
   accessWindow: AccountRecord["accessWindow"];
+  assignmentBaseline: UsageBaseline;
 } {
   return (
     typeof value === "object" &&
@@ -147,6 +154,9 @@ function validAccountCreate(
     "peerId" in value &&
     typeof value.peerId === "string" &&
     /^[a-f0-9]{64}$/.test(value.peerId) &&
+    "assignmentBaseline" in value &&
+    validUsageBaseline(value.assignmentBaseline) &&
+    value.assignmentBaseline.peerId === value.peerId &&
     "note" in value &&
     typeof value.note === "string" &&
     value.note.length <= 240 &&
@@ -166,8 +176,9 @@ type AccountPatch = Partial<
     | "maxConcurrentConnections"
     | "accessWindow"
     | "passwordHash"
+    | "peerId"
   >
->;
+> & { assignmentBoundary?: AssignmentBoundary };
 
 function validAccountPatch(value: unknown): value is AccountPatch {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -184,6 +195,8 @@ function validAccountPatch(value: unknown): value is AccountPatch {
     "maxConcurrentConnections",
     "accessWindow",
     "passwordHash",
+    "peerId",
+    "assignmentBoundary",
   ]);
   return (
     Object.keys(payload).length > 0 &&
@@ -203,7 +216,13 @@ function validAccountPatch(value: unknown): value is AccountPatch {
     (!("maxConcurrentConnections" in payload) ||
       validOptionalInteger(payload.maxConcurrentConnections, 64)) &&
     (!("accessWindow" in payload) || validAccessWindow(payload.accessWindow)) &&
-    (!("passwordHash" in payload) || validScryptHash(payload.passwordHash))
+    (!("passwordHash" in payload) || validScryptHash(payload.passwordHash)) &&
+    (!("peerId" in payload) ||
+      (typeof payload.peerId === "string" &&
+        /^[a-f0-9]{64}$/.test(payload.peerId))) &&
+    (!("assignmentBoundary" in payload) ||
+      ("peerId" in payload && validAssignmentBoundary(payload.assignmentBoundary))) &&
+    (("peerId" in payload) === ("assignmentBoundary" in payload))
   );
 }
 
@@ -463,6 +482,9 @@ export class DynamicIpRegistry extends DurableObject<Env> {
     if (!stored) return undefined;
     return {
       ...stored,
+      usageAssignments: Array.isArray(stored.usageAssignments)
+        ? stored.usageAssignments
+        : [],
       authVersion: Number.isSafeInteger(stored.authVersion)
         ? stored.authVersion
         : 0,
@@ -630,7 +652,54 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         ? await this.getAccountById(id)
         : undefined;
       if (!account) return jsonResponse({ error: "Account not found." }, 404);
-      return jsonResponse({ account: publicAccount(account) });
+      return jsonResponse({
+        account: {
+          ...publicAccount(account),
+          usageAssignments: account.usageAssignments,
+        },
+      });
+    }
+
+    if (
+      pathname === "/internal/profile/assignment-baseline" &&
+      request.method === "POST"
+    ) {
+      const payload = await request.json<Record<string, unknown>>().catch(() => null);
+      const baselineValue = payload?.baseline;
+      if (
+        typeof payload?.id !== "string" ||
+        !/^[0-9a-f-]{36}$/i.test(payload.id) ||
+        !validUsageBaseline(baselineValue)
+      ) {
+        return jsonResponse({ error: "Invalid assignment baseline." }, 400);
+      }
+      const baseline = baselineValue;
+      const result = await this.ctx.storage.transaction(async (transaction) => {
+        const key = `account:${payload.id}`;
+        const account = await transaction.get<AccountRecord>(key);
+        if (!account) return { error: "missing" as const };
+        if (baseline.peerId !== account.peerId) {
+          return { error: "peer" as const };
+        }
+        const existing = Array.isArray(account.usageAssignments)
+          ? account.usageAssignments
+          : [];
+        if (existing.length > 0) return { assignments: existing };
+        const assignments = [{
+          peerId: baseline.peerId,
+          assignedAt: baseline.sampledAt,
+          startUploadBytes: baseline.uploadBytes,
+          startDownloadBytes: baseline.downloadBytes,
+        }];
+        await transaction.put(key, { ...account, usageAssignments: assignments });
+        return { assignments };
+      });
+      if ("error" in result) {
+        return result.error === "missing"
+          ? jsonResponse({ error: "Account not found." }, 404)
+          : jsonResponse({ error: "Assignment baseline does not match the peer." }, 409);
+      }
+      return jsonResponse({ usageAssignments: result.assignments });
     }
 
     if (pathname === "/internal/accounts" && request.method === "GET") {
@@ -668,6 +737,12 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         downloadLimitMbps: payload.downloadLimitMbps,
         maxConcurrentConnections: payload.maxConcurrentConnections,
         accessWindow: payload.accessWindow,
+        usageAssignments: [{
+          peerId: payload.assignmentBaseline.peerId,
+          assignedAt: payload.assignmentBaseline.sampledAt,
+          startUploadBytes: payload.assignmentBaseline.uploadBytes,
+          startDownloadBytes: payload.assignmentBaseline.downloadBytes,
+        }],
         createdAt: new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
@@ -675,7 +750,10 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         const nameKey = `account-name:${record.normalizedUsername}`;
         if (await transaction.get(nameKey)) return false;
         const existing = await transaction.list<AccountRecord>({ prefix: "account:" });
-        if ([...existing.values()].some((account) => account.peerId === record.peerId)) {
+        if (isPeerAssignedToAnotherAccount(
+          existing.values(),
+          record.peerId,
+        )) {
           return false;
         }
         await transaction.put(`account:${record.id}`, record);
@@ -708,22 +786,66 @@ export class DynamicIpRegistry extends DurableObject<Env> {
         const authVersion = Number.isSafeInteger(account.authVersion)
           ? account.authVersion
           : 0;
+        const peerChanged =
+          typeof payload.peerId === "string" && payload.peerId !== account.peerId;
+        if (
+          payload.assignmentBoundary !== undefined &&
+          !peerChanged
+        ) {
+          return { error: "invalid-boundary" as const };
+        }
+        if (
+          peerChanged &&
+          typeof payload.peerId === "string"
+        ) {
+          const existing = await transaction.list<AccountRecord>({ prefix: "account:" });
+          if (isPeerAssignedToAnotherAccount(
+            existing.values(),
+            payload.peerId,
+            account.id,
+          )) {
+            return { error: "peer-in-use" as const };
+          }
+        }
         const revokeExistingSessions =
           payload.passwordHash !== undefined ||
           (payload.status !== undefined && payload.status !== account.status);
+        const {
+          peerId: nextPeerId,
+          assignmentBoundary,
+          ...updates
+        } = payload;
+        let usageAssignments = Array.isArray(account.usageAssignments)
+          ? [...account.usageAssignments]
+          : [];
+        if (peerChanged && nextPeerId && assignmentBoundary) {
+          usageAssignments = reassignUsagePeriods(
+            usageAssignments,
+            account.peerId,
+            nextPeerId,
+            assignmentBoundary,
+          );
+        }
         const next: AccountRecord = {
           ...account,
-          ...payload,
+          ...updates,
+          ...(peerChanged && nextPeerId ? { peerId: nextPeerId } : {}),
+          usageAssignments,
           authVersion: authVersion + Number(revokeExistingSessions),
-          note: typeof payload.note === "string" ? payload.note.trim() : account.note,
+          note: typeof updates.note === "string" ? updates.note.trim() : account.note,
           updatedAt: new Date().toISOString(),
         };
         await transaction.put(key, next);
-        return next;
+        return { account: next };
       });
       if (!updated) return jsonResponse({ error: "Account not found." }, 404);
-      await this.appendAudit("account_updated", updated.username);
-      return jsonResponse({ account: publicAccount(updated) });
+      if ("error" in updated) {
+        return updated.error === "peer-in-use"
+          ? jsonResponse({ error: "Peer is already assigned to another account." }, 409)
+          : jsonResponse({ error: "Invalid peer reassignment boundary." }, 400);
+      }
+      await this.appendAudit("account_updated", updated.account.username);
+      return jsonResponse({ account: publicAccount(updated.account) });
     }
 
     if (pathname.startsWith("/internal/accounts/") && request.method === "DELETE") {

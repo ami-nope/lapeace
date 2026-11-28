@@ -25,7 +25,8 @@ deploy/               Deployment templates and instructions
 
 The agent reads `MONITOR_STATE_FILE` (default
 `/opt/lapeace/data/usage.json`) and never writes to that file. It does not
-independently query AWG for dashboard telemetry or calculate peer accounting.
+independently query AWG for dashboard telemetry. The Next.js BFF calculates
+account usage from assignment baselines and the agent's per-peer daily history.
 Peer public keys are reduced to fingerprints/opaque IDs; endpoint and
 preshared-key fields are not returned. The AWG dump parser remains for isolated
 parser validation only. The agent does not modify AWG, WARP, routes, NAT,
@@ -33,10 +34,11 @@ firewall rules, or traffic control.
 
 Admin sign-in uses an environment-configured scrypt password hash. The admin
 can create, suspend, reactivate, update, and delete user accounts, each mapped
-to one existing peer. User sessions can only retrieve their own daily usage,
-configured daily quota, and current upload/download rates; they cannot access
-peer identifiers, the peer table, server totals, account management, or
-Dynamic SSH controls. Account credentials are hashed before persistent storage.
+to one existing peer at a time. User sessions can only retrieve their own
+daily/monthly usage, configured quotas, and current upload/download rates; they
+cannot access peer identifiers, the peer table, server totals, account
+management, or Dynamic SSH controls. Account credentials are hashed before
+persistent storage.
 Login attempts are rate-limited and account/admin events are retained for up to
 three days. Quotas, speeds, connection limits, and time windows are advisory
 display settings only; they do not enforce or change VPN access.
@@ -391,10 +393,11 @@ peer → date → counters, with `upload_bytes`/`download_bytes` values.
 
 The existing API response shape is retained: client upload maps to `rxBytes`
 and `rxBps`; client download maps to `txBytes` and `txBps`. Mbps is converted to
-bytes per second using `1 Mbps = 125,000 bytes/second`. Daily history sums the
-monitor's existing per-peer daily upload/download values by date. The adapter
-does not recalculate usage from raw counters. `last_sample` is returned as
-`sampledAt`; naive timestamps are interpreted as Asia/Kolkata.
+bytes per second using `1 Mbps = 125,000 bytes/second`. The response also
+includes the per-peer upload/download counters and up to 31 calendar days of
+per-peer daily history, identified only by opaque peer ID. It does not recalculate
+usage from raw interface counters. `last_sample` is returned as `sampledAt`;
+naive timestamps are interpreted as Asia/Kolkata.
 
 ## Dynamic SSH Manager — local implementation, not deployed
 
@@ -516,9 +519,10 @@ The admin account-management UI is available only in the signed admin session.
 Creation validates usernames, passwords, peer IDs, and policy values; an
 existing peer can be assigned to only one portal account. Deleting a portal
 account does not revoke or alter its AWG peer. User-facing telemetry is reduced
-server-side to the assigned peer's daily byte total, upload/download rates,
-sample time, and configured daily quota. A malformed agent response is rejected.
-The account store never sends password hashes to the browser.
+server-side to the account's own daily/monthly totals, upload/download rates,
+sample time, and configured quotas. A malformed or incomplete agent response
+is rejected. The account store never sends password hashes or assignment
+baselines to the browser.
 
 ### Multi-user portal — local implementation, not deployed
 
@@ -546,12 +550,43 @@ normalized identifier per 15-minute window. The audit view prunes entries
 older than three days.
 
 User sessions can request only their assigned peer's daily total, current
-upload/download speeds, sample timestamp, and daily quota. They cannot request
-raw VPS snapshots, peer identifiers/IPs, global metrics, account lists, audit
-events, or dynamic-IP management. Suspended or deleted accounts are rejected
-when the user summary is requested. The user-facing portal explicitly labels
-quotas and usage as informational; policy values do not enforce traffic or VPN
-access.
+upload/download totals and speeds, monthly totals, sample timestamp, and daily
+and monthly quotas. The BFF calculates usage only for the account's stored
+assignment periods, using IST dates and the assignment-day counter baseline.
+Peer reassignment closes the prior period with final counters and starts a new
+period from the current sample. The Worker prevents one peer from being
+assigned to multiple accounts. Users cannot request raw VPS snapshots, peer
+identifiers/IPs, global metrics, account lists, audit events, or dynamic-IP
+management. Suspended or deleted accounts are rejected when the user summary
+is requested. The user-facing portal explicitly labels quotas and usage as
+informational; policy values do not enforce traffic or VPN access.
+
+Existing Durable Object records need no schema migration. An existing account
+without assignment history is initialized on its first telemetry request with
+a current-day sample: the current peer and sample time/counters become the
+baseline, and accounting starts at that point. Traffic from before that
+migration boundary is not charged; existing monitor counters and history are
+not reset or rewritten.
+New account and peer-reassignment baselines are captured server-side from the
+authenticated agent snapshot. Monthly totals use the current Asia/Kolkata
+calendar month. If the agent's retained history does not cover the needed month
+or the assigned peer is missing, the endpoint reports telemetry unavailable
+rather than presenting an incomplete total as zero.
+
+#### Per-account usage rollout
+
+The change requires the updated `agent/app.py`, Cloudflare Worker, and Vercel
+application. Deploy the agent adapter update first through its already-approved
+process; leave `agent/monitor.py`, `/opt/lapeace/data/usage.json`, AWG/WARP
+configuration, and networking untouched. Then deploy the Worker from
+`cloudflare/` with `npm run deploy` (no Durable Object migration is added),
+and deploy the reviewed application commit through the Vercel project whose
+Root Directory is `web`. Configure the existing `AGENT_BASE_URL`,
+`AGENT_API_TOKEN`, `ACCOUNT_STORE_API_URL`, and `ACCOUNT_STORE_TOKEN` as
+server-side variables/secrets; no new secret is introduced. Verify one legacy
+account's first-summary baseline, a newly assigned account, a peer reassignment,
+IST midnight/month rollover, and telemetry-unavailable behavior before
+promoting the Vercel deployment to production.
 
 The changed account-related files include:
 
@@ -565,11 +600,18 @@ The changed account-related files include:
   `web/app/api/accounts/audit/route.ts` — admin-only account and audit APIs.
 - `web/app/api/panel/[...segments]/route.ts` — admin proxy allowlist and the
   user-only sanitized telemetry endpoint.
+- `web/lib/agent-usage.ts` and `web/lib/usage-accounting.ts` — authenticated
+  snapshot validation, baseline initialization, IST date handling, and
+  per-assignment daily/monthly accounting.
 - `web/components/admin-accounts.tsx` and `web/components/dashboard.tsx` —
   account management and role-separated dashboards.
 - `cloudflare/src/accounts.ts`, `cloudflare/src/worker.ts`, and
   `cloudflare/tests/accounts.test.mjs` — account validation, persistence,
   login throttling, audit retention, and focused validation tests.
+- `agent/app.py` and `agent/test_app.py` — sanitized per-peer daily history
+  exposure for monthly accounting; the monitor implementation and state file
+  are unchanged. `web/tests/usage-accounting.test.mjs` covers accounting
+  boundaries and quota calculations.
 
 Before deploying this feature, configure `ACCOUNT_STORE_API_URL` and
 `ACCOUNT_STORE_TOKEN` in Vercel, and set the matching `ACCOUNT_STORE_TOKEN` as a
@@ -585,6 +627,20 @@ Run account Worker checks from `cloudflare/` with:
 ```sh
 npm run typecheck
 npm test
+```
+
+Run frontend checks from `web/` with:
+
+```sh
+npm run typecheck
+npm run test:accounting
+npm run build
+```
+
+Run telemetry adapter tests from `agent/` with:
+
+```sh
+python -m pytest -q
 ```
 
 On the VPS, configure the agent process with the environment variables above,

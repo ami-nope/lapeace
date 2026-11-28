@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "typecheck": "tsc --noEmit",
+    "test:accounting": "node --experimental-strip-types --test tests/*.test.mjs",
     "hash-password": "node scripts/hash-password.mjs"
   },
   "dependencies": {
