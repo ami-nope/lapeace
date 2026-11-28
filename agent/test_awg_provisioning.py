@@ -8,7 +8,8 @@ import subprocess
 
 import pytest
 
-from awg_provisioning import (
+from awg_helper import (
+    AWG_EXECUTABLE,
     AWGClientConflict,
     AWGClientNotFound,
     AWGPeerManager,
@@ -67,14 +68,14 @@ class FakeAWG:
     def __call__(self, arguments: list[str], **kwargs) -> subprocess.CompletedProcess[str]:
         self.calls.append(arguments)
         self.invocations.append((arguments, kwargs))
-        if arguments == ["awg", "genkey"]:
+        if arguments == [AWG_EXECUTABLE, "genkey"]:
             private_key = CLIENT_PRIVATE_KEYS[self.generated]
             self.generated += 1
             return subprocess.CompletedProcess(arguments, 0, private_key + "\n", "")
-        if arguments == ["awg", "pubkey"]:
+        if arguments == [AWG_EXECUTABLE, "pubkey"]:
             public_key = self.public_by_private[kwargs["input"].strip()]
             return subprocess.CompletedProcess(arguments, 0, public_key + "\n", "")
-        if arguments == ["awg", "show", "awg0", "dump"]:
+        if arguments == [AWG_EXECUTABLE, "show", "awg0", "dump"]:
             peers = [
                 "\t".join(
                     [public_key, "(none)", "(none)", allowed_ips, "0", "0", "0", "off"]
@@ -85,7 +86,7 @@ class FakeAWG:
             if peers:
                 dump += "\n".join(peers) + "\n"
             return subprocess.CompletedProcess(arguments, 0, dump, "")
-        if arguments[:4] == ["awg", "set", "awg0", "peer"]:
+        if arguments[:4] == [AWG_EXECUTABLE, "set", "awg0", "peer"]:
             public_key = arguments[4]
             if arguments[-1] == "remove":
                 self.runtime.pop(public_key, None)
@@ -129,9 +130,27 @@ def test_key_generation_and_unique_ipv4_allocation_preserve_existing_config(tmp_
     assert f"PresharedKey = {EXISTING_PRESHARED_KEY}" in config
     assert "PostUp = preserve-this-routing-rule" in config
     assert "PostDown = preserve-this-other-rule" in config
-    assert all(call[0] == "awg" for call in runner.calls)
+    assert all(call[0] == AWG_EXECUTABLE for call in runner.calls)
     assert all(call[1] != "set" or call[2] == "awg0" for call in runner.calls)
     assert all(kwargs["shell"] is False for _, kwargs in runner.invocations)
+
+
+def test_list_clients_exposes_managed_metadata_without_private_keys(tmp_path):
+    manager = make_manager(tmp_path, FakeAWG())
+    created = manager.create("phone")
+
+    clients = manager.list_clients()
+
+    assert clients == [
+        {
+            "clientId": created["clientId"],
+            "label": "phone",
+            "address": "10.66.67.3/32",
+            "status": "active",
+        }
+    ]
+    assert "privateKey" not in str(clients)
+    assert "publicKey" not in str(clients)
 
 
 def test_client_config_and_qr_expose_only_the_new_client_key(tmp_path):
@@ -265,7 +284,9 @@ def test_state_persistence_failure_restores_config_before_runtime_change(
     assert manager.config_path.read_bytes() == original_config
     assert not manager.state_path.exists()
     assert runner.runtime == {EXISTING_PUBLIC: "10.66.67.2/32"}
-    assert not any(command[:2] == ["awg", "set"] for command in runner.calls)
+    assert not any(
+        command[:2] == [AWG_EXECUTABLE, "set"] for command in runner.calls
+    )
 
 
 def test_invalid_label_and_invalid_endpoint_do_not_execute_commands(tmp_path):

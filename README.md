@@ -349,49 +349,123 @@ telemetry as **NOT VERIFIED**.
 ### Ubuntu VPS agent — local implementation, not deployed
 
 The telemetry adapter remains read-only against `lapeace-monitor` and
-`usage.json`. The separate peer manager edits only `[Peer]` blocks in the
-authoritative AmneziaWG config and applies matching runtime changes with fixed
-`awg` argument vectors; it does not invoke a shell or restart the interface.
-Do not install or run the new peer operations until their access policy and
-the exact server config have been reviewed. Keep the existing monitor service
-and data unchanged. The intended listener is loopback only; Vercel needs an
-approved HTTPS reverse-proxy or private-tunnel path. Never expose the FastAPI
-listener directly to the public Internet.
+`usage.json`. The API process is an unprivileged Unix-socket client; the
+separate root-owned helper alone reads or atomically updates the authoritative
+AmneziaWG config, manages its root-owned client-key store, and applies runtime
+peer changes with fixed `awg` argument vectors. Peer operations never restart
+the interface. Keep the existing monitor service and data unchanged. The
+intended FastAPI listener is loopback only; Vercel needs an approved HTTPS
+reverse-proxy or private-tunnel path. Never expose the FastAPI listener
+directly to the public Internet.
 
 1. Verify the existing monitor JSON schema, path, atomic-write behavior, and
    `lapeace-monitor` service identity. Do not share private keys, preshared keys,
    tokens, or endpoint details in diagnostics.
-2. Keep the monitor JSON read-only. Peer operations require narrowly scoped
-   permission to read and atomically replace the AWG config, access the
-   `awg0` interface with `awg set`, and read/write the private client-state
-   file. Review the service identity and least-privilege mechanism before
-   enabling them; do not grant unrelated WARP, firewall, routing, or service
-   management privileges.
-3. Install `agent/requirements.txt` in an isolated virtual environment. Set
-   `PANEL_API_TOKEN` to a random secret of at least 32 bytes,
-   `MONITOR_STATE_FILE=/opt/lapeace/data/usage.json`,
-   `AWG_INTERFACE=awg0`,
-   `AWG_CONFIG_FILE=/etc/amnezia/amneziawg/awg0.conf`,
-   `AWG_CLIENT_STATE_FILE=/var/lib/lapeace-agent/awg-clients.json`, and
-   `AWG_SERVER_ENDPOINT=<public-hostname-or-IP>:51820`. Configure
-   `AWG_CLIENT_ALLOWED_IPS` and `AWG_CLIENT_DNS` for the intended client routes.
-   The private client keys needed for re-download are stored in the dedicated
-   state file with mode `0600`; protect that file and its parent directory.
-4. Start exactly one Uvicorn worker bound to `127.0.0.1` only:
+2. Keep the monitor JSON read-only. The VPS already has user `lapeace-agent`
+   and primary group `lapeace`; verify them rather than creating duplicates.
+   The helper also needs the `lapeace-agent` supplementary group for its
+   socket. Create that group only if it is absent. Preserve the existing
+   service identity and add the supplementary group to the agent unit:
 
    ```sh
-   .venv/bin/uvicorn app:app --host 127.0.0.1 --port 8765 --workers 1
+   getent passwd lapeace-agent
+   getent group lapeace
+   getent group lapeace-agent || sudo groupadd --system lapeace-agent
+   sudo systemctl edit lapeace-agent.service
+   ```
+
+   Add this drop-in, preserving the existing `User` and `Group` values:
+
+   ```ini
+   [Service]
+   User=lapeace-agent
+   Group=lapeace
+   SupplementaryGroups=lapeace-agent
+   ```
+
+   Reload systemd and restart the agent service after changing supplementary
+   groups; a reload alone does not update the running process:
+
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl restart lapeace-agent.service
+   ```
+
+   The helper checks the connecting UID with Linux `SO_PEERCRED`; socket group
+   membership grants filesystem access but does not authorize other UIDs.
+3. Install `agent/requirements.txt` in the same isolated virtual environment
+   used by both services. Set `PANEL_API_TOKEN` to a random secret of at least
+   32 bytes, `MONITOR_STATE_FILE=/opt/lapeace/data/usage.json`, and
+   `AWG_INTERFACE=awg0` in the agent environment. Do not configure AWG file
+   paths or endpoint settings in the unprivileged agent environment.
+4. Configure and install the privileged helper. Keep its environment file
+   root-owned and mode `0600`; it contains the client endpoint and route/DNS
+   settings, not private keys:
+
+   ```sh
+   sudo install -d -o root -g root -m 0700 /etc/lapeace-awg
+   sudo install -o root -g root -m 0600 agent/awg-helper.env.example \
+     /etc/lapeace-awg/helper.env
+   sudoedit /etc/lapeace-awg/helper.env
+   sudo install -o root -g root -m 0644 agent/lapeace-awg-helper.service \
+     /etc/systemd/system/lapeace-awg-helper.service
+   ```
+
+   If the user or group already exists, verify it rather than recreating it.
+   The helper owns `/var/lib/lapeace-awg/clients.json` (mode `0600`) and
+   creates `/run/lapeace-awg/helper.sock` as `root:lapeace-agent` mode `0660`.
+   Its allowlisted protocol accepts only peer lifecycle operations; it accepts
+   no paths, commands, interface names, public keys, or IP addresses from the
+   agent. The API service must run as UID `lapeace-agent` to use the socket.
+   If `/var/lib/lapeace-agent/awg-clients.json` exists from an earlier
+   deployment, stop the old API and migrate it before starting the helper.
+   Create `/var/lib/lapeace-awg` as `root:root` mode `0700`, verify the new
+   destination does not exist, then copy the legacy file to
+   `/var/lib/lapeace-awg/clients.json` as `root:root` mode `0600`. Compare the
+   files before bringing up the new helper; after confirming managed peers are
+   listed, remove or securely archive the old copy so the API user cannot read
+   its private keys. The helper refuses to start when it detects an
+   unmigrated legacy state file and never overwrites an existing destination.
+   Then start the helper:
+
+   ```sh
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now lapeace-awg-helper.service
+   ```
+
+   Verify its ownership and permissions, the service's effective groups, and
+   a successful request using the agent UID:
+
+   ```sh
+   sudo stat -c '%U:%G %a %n' /run/lapeace-awg/helper.sock
+   sudo systemctl show lapeace-agent.service -p User -p Group -p SupplementaryGroups
+   pid=$(systemctl show -p MainPID --value lapeace-agent.service)
+   grep -E '^(Uid|Gid|Groups):' "/proc/$pid/status"
+   sudo -u lapeace-agent -g lapeace -G lapeace-agent \
+     /opt/lapeace/agent-venv/bin/python -c 'import socket; s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM); s.connect("/run/lapeace-awg/helper.sock"); s.sendall(b"{\"operation\":\"list\"}\n"); print(s.recv(65536).decode().strip()); s.close()'
+   ```
+
+   The `stat` output must be `root:lapeace-agent 660`. The helper's
+   `SO_PEERCRED` check must continue to accept only the `lapeace-agent` UID,
+   even when another UID belongs to the socket group. The helper tests include
+   a rejected non-agent UID case; run them with
+   `python -m pytest -q test_awg_helper.py` from `agent/`.
+5. Start exactly one Uvicorn worker bound to `127.0.0.1` only:
+
+   ```sh
+   /opt/lapeace/agent-venv/bin/uvicorn app:app --host 127.0.0.1 \
+     --port 8765 --workers 1
    ```
 
    Supply the environment variables through the approved service manager. Put
    the listener behind HTTPS with authentication
    and network restrictions; the agent itself also checks the bearer token on
    every endpoint. Do not enable public access to its OpenAPI/docs endpoints.
-5. Configure the Vercel variables above with the HTTPS agent URL and matching
-   API token. Compare the adapter response to a sanitized monitor snapshot,
+6. Configure the Vercel variables with the HTTPS agent URL and matching API
+   token. Compare the adapter response to a sanitized monitor snapshot,
    verify upload/download direction and IST daily totals, and verify the source
    JSON hash and modification time are unchanged after repeated reads.
-6. Verify provisioning, pause/resume, regeneration, revocation, rollback, and
+7. Verify provisioning, pause/resume, regeneration, revocation, rollback, and
    config/QR downloads on a non-production interface or approved maintenance
    window before enabling these operations against `awg0`. Regeneration changes
    the peer ID; first provision a replacement, reassign any account through the
@@ -671,9 +745,10 @@ On the VPS, configure the agent process with the environment variables above,
 but keep both opt-in settings false until the protected exclusion inventory,
 `warp-cli` permissions/semantics, state-file owner/mode, and rollback plan are
 verified. Do not modify the existing `lapeace-monitor` service or its JSON data.
-No systemd unit is supplied because the current host service configuration
-and correct privilege model have not been inspected. Use one poller instance
-only.
+The privileged peer helper unit is supplied in
+`agent/lapeace-awg-helper.service`. No Dynamic SSH poller unit is supplied
+because the current host service configuration and correct privilege model
+have not been inspected. Use one poller instance only.
 
 If a WARP add command's outcome is uncertain, the agent preserves a
 `pending_add` marker and refuses to retry it automatically. Reconcile that IP

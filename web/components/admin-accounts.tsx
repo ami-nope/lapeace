@@ -10,6 +10,29 @@ type PeerOption = {
   allowedIps: string[];
 };
 
+type ManagedPeer = {
+  clientId: string;
+  label: string;
+  address: string;
+  status: "active" | "paused";
+};
+
+function isManagedPeer(value: unknown): value is ManagedPeer {
+  return (
+    typeof value === "object" &&
+    value !== null &&
+    "clientId" in value &&
+    typeof value.clientId === "string" &&
+    /^[a-f0-9]{64}$/.test(value.clientId) &&
+    "label" in value &&
+    typeof value.label === "string" &&
+    "address" in value &&
+    typeof value.address === "string" &&
+    "status" in value &&
+    (value.status === "active" || value.status === "paused")
+  );
+}
+
 type AuditResult = {
   events: AuditRecord[];
   retentionDays: number;
@@ -52,10 +75,17 @@ function quotaInput(value: number | null): string {
 
 export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
   const [accounts, setAccounts] = useState<PortalAccount[]>([]);
+  const [managedPeers, setManagedPeers] = useState<ManagedPeer[]>([]);
   const [audit, setAudit] = useState<AuditResult | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const [peerError, setPeerError] = useState("");
+  const [peerNotice, setPeerNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [peerBusy, setPeerBusy] = useState<string | null>(null);
+  const [peerLabel, setPeerLabel] = useState("");
+  const [qrPeerId, setQrPeerId] = useState<string | null>(null);
+  const [assignmentTargets, setAssignmentTargets] = useState<Record<string, string>>({});
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [peerId, setPeerId] = useState("");
@@ -90,6 +120,38 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
       if (auditResponse.ok) {
         setAudit((await auditResponse.json()) as AuditResult);
       }
+      try {
+        const managedResponse = await fetch("/api/panel/clients", {
+          cache: "no-store",
+        });
+        if (!managedResponse.ok) {
+          const result = (await managedResponse.json()) as {
+            error?: string;
+            detail?: string;
+          };
+          throw new Error(
+            result.error ?? result.detail ?? "Could not load managed peers.",
+          );
+        }
+        const managedResult = (await managedResponse.json()) as {
+          clients?: unknown;
+        };
+        if (
+          !Array.isArray(managedResult.clients) ||
+          !managedResult.clients.every(isManagedPeer)
+        ) {
+          throw new Error("The agent returned invalid managed peer data.");
+        }
+        setManagedPeers(managedResult.clients);
+        setPeerError("");
+      } catch (caught) {
+        setManagedPeers([]);
+        setPeerError(
+          caught instanceof Error
+            ? caught.message
+            : "Managed peer service unavailable.",
+        );
+      }
       setError("");
     } catch (caught) {
       setError(
@@ -101,6 +163,147 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
   useEffect(() => {
     void refresh();
   }, [refresh]);
+
+  const accountPeers = peers.map((peer) => ({
+    ...peer,
+    allowedIps: [...peer.allowedIps],
+  }));
+  for (const managedPeer of managedPeers) {
+    const existing = accountPeers.find((peer) => peer.id === managedPeer.clientId);
+    if (existing) {
+      existing.allowedIps = [managedPeer.address];
+    } else {
+      accountPeers.push({
+        id: managedPeer.clientId,
+        fingerprint: managedPeer.clientId.slice(0, 16),
+        allowedIps: [managedPeer.address],
+      });
+    }
+  }
+
+  async function createPeer(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setPeerBusy("create");
+    setPeerError("");
+    setPeerNotice("");
+    try {
+      const response = await fetch("/api/panel/clients", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ label: peerLabel }),
+      });
+      if (!response.ok) {
+        const result = (await response.json()) as {
+          error?: string;
+          detail?: string;
+        };
+        throw new Error(
+          result.error ?? result.detail ?? `Peer creation failed (${response.status}).`,
+        );
+      }
+      setPeerLabel("");
+      setPeerNotice("Peer created. Download its config or show the QR code.");
+      await refresh();
+    } catch (caught) {
+      setPeerError(
+        caught instanceof Error ? caught.message : "Peer service unavailable.",
+      );
+    } finally {
+      setPeerBusy(null);
+    }
+  }
+
+  async function assignPeer(peer: ManagedPeer) {
+    const targetAccountId =
+      accounts.find((account) => account.peerId === peer.clientId)?.id ??
+      assignmentTargets[peer.clientId] ??
+      "";
+    const account = accounts.find((item) => item.id === targetAccountId);
+    if (!account) {
+      setPeerError("Select an account to assign this peer to.");
+      return;
+    }
+    if (account.peerId === peer.clientId) {
+      setPeerNotice(`${peer.label} is already assigned to ${account.username}.`);
+      return;
+    }
+    setPeerBusy(peer.clientId);
+    setPeerError("");
+    setPeerNotice("");
+    try {
+      const response = await fetch(`/api/accounts/${account.id}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ peerId: peer.clientId }),
+      });
+      if (!response.ok) {
+        const result = (await response.json()) as { error?: string };
+        throw new Error(result.error ?? "Could not assign peer to account.");
+      }
+      setPeerNotice(`Assigned ${peer.label} to ${account.username}.`);
+      await refresh();
+    } catch (caught) {
+      setPeerError(
+        caught instanceof Error ? caught.message : "Account service unavailable.",
+      );
+    } finally {
+      setPeerBusy(null);
+    }
+  }
+
+  async function changePeerStatus(
+    peer: ManagedPeer,
+    action: "pause" | "resume" | "revoke" | "regenerate",
+  ) {
+    const assignedAccount = accounts.find((account) => account.peerId === peer.clientId);
+    if (action === "revoke" || action === "regenerate") {
+      if (assignedAccount) {
+        setPeerError(
+          `Reassign ${peer.label} from ${assignedAccount.username} before ${action === "revoke" ? "revoking" : "regenerating"} it.`,
+        );
+        return;
+      }
+      const prompt =
+        action === "revoke"
+          ? `Permanently revoke ${peer.label}?`
+          : `Regenerate keys for ${peer.label}? Its current config will stop working.`;
+      if (!window.confirm(prompt)) return;
+    }
+
+    setPeerBusy(peer.clientId);
+    setPeerError("");
+    setPeerNotice("");
+    try {
+      const response = await fetch(
+        `/api/panel/clients/${peer.clientId}${action === "revoke" ? "" : `/${action}`}`,
+        { method: action === "revoke" ? "DELETE" : "POST" },
+      );
+      if (!response.ok) {
+        const result = (await response.json()) as {
+          error?: string;
+          detail?: string;
+        };
+        throw new Error(
+          result.error ?? result.detail ?? `Peer ${action} failed (${response.status}).`,
+        );
+      }
+      setPeerNotice(
+        action === "revoke"
+          ? `Revoked ${peer.label}.`
+          : action === "regenerate"
+            ? `Regenerated keys for ${peer.label}; download its new config.`
+            : `${peer.label} ${action === "pause" ? "paused" : "resumed"}.`,
+      );
+      if (qrPeerId === peer.clientId) setQrPeerId(null);
+      await refresh();
+    } catch (caught) {
+      setPeerError(
+        caught instanceof Error ? caught.message : "Peer service unavailable.",
+      );
+    } finally {
+      setPeerBusy(null);
+    }
+  }
 
   async function createAccount(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -284,6 +487,178 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
           {accounts.length} ACCOUNTS · DISPLAY-ONLY POLICY
         </span>
       </div>
+      <div className="space-y-3 border-b border-[#26382b] p-3">
+        <form className="flex flex-wrap items-end gap-2" onSubmit={createPeer}>
+          <label className="min-w-48 flex-1">
+            <span className="mono-label mb-1 block">Create AmneziaWG peer · label</span>
+            <input
+              className="h-8 w-full border border-[#354839] bg-[#090d0a] px-2 text-[10px] outline-none focus:border-[#65d98a]"
+              maxLength={48}
+              minLength={1}
+              onChange={(event) => setPeerLabel(event.target.value)}
+              pattern="[A-Za-z0-9 _.-]+"
+              required
+              value={peerLabel}
+            />
+          </label>
+          <Button disabled={peerBusy !== null} size="small" type="submit">
+            {peerBusy === "create" ? "CREATING…" : "CREATE PEER"}
+          </Button>
+        </form>
+        {peerError && (
+          <p className="text-[9px] text-[#e2a095]" role="alert">{peerError}</p>
+        )}
+        {peerNotice && (
+          <p className="text-[9px] text-[#65d98a]" role="status">{peerNotice}</p>
+        )}
+        <div className="overflow-x-auto border border-[#26382b] bg-[#090d0a]">
+          <table className="w-full min-w-[900px] text-left text-[10px]">
+            <thead>
+              <tr className="border-b border-[#26382b] text-[9px] text-[#718276]">
+                <th className="px-3 py-2 font-normal">MANAGED PEER</th>
+                <th className="px-3 py-2 font-normal">VPN IP</th>
+                <th className="px-3 py-2 font-normal">ACCOUNT ASSIGNMENT</th>
+                <th className="px-3 py-2 font-normal">LIFECYCLE</th>
+                <th className="px-3 py-2 font-normal">CONFIG</th>
+              </tr>
+            </thead>
+            <tbody>
+              {managedPeers.map((peer) => {
+                const owner = accounts.find((account) => account.peerId === peer.clientId);
+                const targetAccountId =
+                  owner?.id ?? assignmentTargets[peer.clientId] ?? "";
+                return (
+                  <tr className="border-b border-[#1e2b21] last:border-0" key={peer.clientId}>
+                    <td className="px-3 py-2">
+                      <div className="text-[#c5d5c7]">{peer.label}</div>
+                      <div className="mt-0.5 text-[9px] text-[#718276]">{peer.clientId.slice(0, 16)}…</div>
+                      <div className={peer.status === "active" ? "mt-1 text-[9px] text-[#65d98a]" : "mt-1 text-[9px] text-[#d8a64e]"}>
+                        {peer.status.toUpperCase()}
+                      </div>
+                    </td>
+                    <td className="px-3 py-2 text-[#9caf9e]">{peer.address}</td>
+                    <td className="px-3 py-2">
+                      <div className="flex gap-1">
+                        <select
+                          aria-label={`Account assignment for ${peer.label}`}
+                          className="h-7 min-w-32 border border-[#354839] bg-[#111813] px-1 text-[9px]"
+                          onChange={(event) =>
+                            setAssignmentTargets({
+                              ...assignmentTargets,
+                              [peer.clientId]: event.target.value,
+                            })
+                          }
+                          value={targetAccountId}
+                        >
+                          <option value="">SELECT ACCOUNT</option>
+                          {accounts
+                            .filter(
+                              (account) =>
+                                account.peerId === peer.clientId || !owner,
+                            )
+                            .map((account) => (
+                              <option key={account.id} value={account.id}>
+                                {account.username}
+                              </option>
+                            ))}
+                        </select>
+                        <Button
+                          disabled={
+                            peerBusy !== null ||
+                            !targetAccountId ||
+                            owner?.id === targetAccountId
+                          }
+                          onClick={() => void assignPeer(peer)}
+                          size="small"
+                          variant="quiet"
+                        >
+                          ASSIGN
+                        </Button>
+                      </div>
+                      <span className="mt-1 block text-[9px] text-[#718276]">
+                        {owner ? `ASSIGNED · ${owner.username}` : "UNASSIGNED"}
+                      </span>
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex gap-1">
+                        <Button
+                          disabled={peerBusy !== null}
+                          onClick={() =>
+                            void changePeerStatus(
+                              peer,
+                              peer.status === "active" ? "pause" : "resume",
+                            )
+                          }
+                          size="small"
+                          variant="quiet"
+                        >
+                          {peer.status === "active" ? "PAUSE" : "RESUME"}
+                        </Button>
+                        <Button
+                          disabled={peerBusy !== null || Boolean(owner)}
+                          onClick={() => void changePeerStatus(peer, "regenerate")}
+                          size="small"
+                          title={owner ? "Reassign this peer first." : undefined}
+                          variant="quiet"
+                        >
+                          REKEY
+                        </Button>
+                        <Button
+                          disabled={peerBusy !== null || Boolean(owner)}
+                          onClick={() => void changePeerStatus(peer, "revoke")}
+                          size="small"
+                          title={owner ? "Reassign this peer first." : undefined}
+                          variant="quiet"
+                        >
+                          REVOKE
+                        </Button>
+                      </div>
+                    </td>
+                    <td className="px-3 py-2">
+                      <div className="flex gap-1">
+                        <a
+                          aria-disabled={peer.status !== "active"}
+                          className={`inline-flex h-7 items-center border border-[#354839] px-2 text-[9px] text-[#9caf9e] hover:border-[#65d98a]${peer.status !== "active" ? " pointer-events-none opacity-40" : ""}`}
+                          href={`/api/panel/clients/${peer.clientId}/config`}
+                          tabIndex={peer.status === "active" ? 0 : -1}
+                        >
+                          DOWNLOAD
+                        </a>
+                        <Button
+                          disabled={peer.status !== "active"}
+                          onClick={() =>
+                            setQrPeerId(qrPeerId === peer.clientId ? null : peer.clientId)
+                          }
+                          size="small"
+                          variant="quiet"
+                        >
+                          {qrPeerId === peer.clientId ? "HIDE QR" : "SHOW QR"}
+                        </Button>
+                      </div>
+                      {qrPeerId === peer.clientId && (
+                        <div className="mt-2 border border-[#26382b] bg-white p-2">
+                          <img
+                            alt={`AmneziaWG configuration QR code for ${peer.label}`}
+                            className="h-36 w-36"
+                            src={`/api/panel/clients/${peer.clientId}/config/qr`}
+                          />
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+              {!managedPeers.length && (
+                <tr>
+                  <td className="px-3 py-5 text-center text-[#718276]" colSpan={5}>
+                    {peerError ? "MANAGED PEERS UNAVAILABLE" : "NO MANAGED PEERS"}
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
       <div className="grid gap-3 p-3 xl:grid-cols-[minmax(0,1.1fr)_minmax(280px,0.9fr)]">
         <div className="min-w-0">
           <div className="overflow-x-auto border border-[#26382b] bg-[#090d0a]">
@@ -299,7 +674,7 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
               </thead>
               <tbody>
                 {accounts.map((account) => {
-                  const peer = peers.find((item) => item.id === account.peerId);
+                  const peer = accountPeers.find((item) => item.id === account.peerId);
                   return (
                     <tr className="border-b border-[#1e2b21] last:border-0" key={account.id}>
                       <td className="px-3 py-2">
@@ -381,19 +756,25 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
                   required
                   value={editing.peerId}
                 >
-                  {!peers.some((peer) => peer.id === editing.peerId) && (
+                  {!accountPeers.some((peer) => peer.id === editing.peerId) && (
                     <option value={editing.peerId}>
                       CURRENT PEER · {editing.peerId.slice(0, 12)} (TELEMETRY UNAVAILABLE)
                     </option>
                   )}
-                  {peers
+                  {accountPeers
                     .filter(
                       (peer) =>
-                        peer.id === editing.peerId ||
-                        !accounts.some(
-                          (account) =>
-                            account.id !== editing.id && account.peerId === peer.id,
-                        ),
+                        (peer.id === editing.peerId ||
+                          managedPeers.every(
+                            (managedPeer) =>
+                              managedPeer.clientId !== peer.id ||
+                              managedPeer.status === "active",
+                          )) &&
+                        (peer.id === editing.peerId ||
+                          !accounts.some(
+                            (account) =>
+                              account.id !== editing.id && account.peerId === peer.id,
+                          )),
                     )
                     .map((peer) => (
                       <option key={peer.id} value={peer.id}>
@@ -554,8 +935,16 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
               value={peerId}
             >
               <option value="">SELECT PEER</option>
-              {peers
-                .filter((peer) => !accounts.some((account) => account.peerId === peer.id))
+              {accountPeers
+                .filter(
+                  (peer) =>
+                    !accounts.some((account) => account.peerId === peer.id) &&
+                    managedPeers.every(
+                      (managedPeer) =>
+                        managedPeer.clientId !== peer.id ||
+                        managedPeer.status === "active",
+                    ),
+                )
                 .map((peer) => (
                 <option key={peer.id} value={peer.id}>
                   {peer.allowedIps.join(", ") || peer.fingerprint}
@@ -655,7 +1044,7 @@ export function AdminAccounts({ peers }: { peers: PeerOption[] }) {
           <div aria-live="polite" className="min-h-4 text-[9px] text-[#d8a64e]">
             {error || notice}
           </div>
-          <Button className="w-full" disabled={busy || peers.length === 0} type="submit">
+          <Button className="w-full" disabled={busy || accountPeers.length === 0} type="submit">
             {busy ? "CREATING…" : "CREATE USER"}
           </Button>
         </form>
