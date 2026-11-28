@@ -13,8 +13,15 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from awg_provisioning import (
+    AWGClientConflict,
+    AWGClientNotFound,
+    AWGPeerManager,
+    AWGProvisioningError,
+)
 from dynamic_ssh import dynamic_sync_loop
 
 INTERFACE_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
@@ -438,53 +445,142 @@ def events() -> list[dict[str, Any]]:
     return []
 
 
-@app.post("/api/v1/clients", dependencies=[Depends(authenticated)])
-def add_client(_: AddPeerRequest) -> None:
-    raise HTTPException(
-        status_code=501,
-        detail="Peer creation is disabled pending inspection of existing AWG persistence.",
-    )
+@app.post(
+    "/api/v1/clients",
+    status_code=201,
+    dependencies=[Depends(authenticated)],
+)
+def add_client(payload: AddPeerRequest) -> dict[str, str]:
+    if any(
+        value is not None
+        for value in (
+            payload.daily_limit_bytes,
+            payload.upload_limit_bps,
+            payload.download_limit_bps,
+        )
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Peer quotas and bandwidth enforcement are not implemented.",
+        )
+    try:
+        return awg_peer_manager().create(payload.label)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
 
 
 @app.post("/api/v1/clients/{client_id}/pause", dependencies=[Depends(authenticated)])
-def pause_client(client_id: str) -> None:
+def pause_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
-    raise HTTPException(
-        status_code=501,
-        detail="Peer pause is disabled pending inspection of existing AWG persistence.",
-    )
+    try:
+        return awg_peer_manager().pause(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
 
 
 @app.post("/api/v1/clients/{client_id}/resume", dependencies=[Depends(authenticated)])
-def resume_client(client_id: str) -> None:
+def resume_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
-    raise HTTPException(
-        status_code=501,
-        detail="Peer resume is disabled pending inspection of existing AWG persistence.",
-    )
+    try:
+        return awg_peer_manager().resume(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
 
 
 @app.delete("/api/v1/clients/{client_id}", dependencies=[Depends(authenticated)])
-def revoke_client(client_id: str) -> None:
+def revoke_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
-    raise HTTPException(
-        status_code=501,
-        detail="Peer revocation is disabled pending inspection of existing AWG persistence.",
-    )
+    try:
+        return awg_peer_manager().revoke(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
+
+
+@app.post(
+    "/api/v1/clients/{client_id}/regenerate",
+    dependencies=[Depends(authenticated)],
+)
+def regenerate_client(client_id: str) -> dict[str, str]:
+    validate_client_id(client_id)
+    try:
+        return awg_peer_manager().regenerate(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
 
 
 @app.get("/api/v1/clients/{client_id}/config", dependencies=[Depends(authenticated)])
-def client_config(client_id: str) -> None:
+def download_client_config(client_id: str) -> Response:
     validate_client_id(client_id)
-    raise HTTPException(
-        status_code=501,
-        detail="Configuration export is disabled until peer provisioning is implemented.",
+    try:
+        config = awg_peer_manager().client_config(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
+    return Response(
+        content=config,
+        media_type="text/plain; charset=utf-8",
+        headers={
+            "Content-Disposition": f'attachment; filename="lapeace-{client_id}.conf"'
+        },
+    )
+
+
+@app.get(
+    "/api/v1/clients/{client_id}/config/qr",
+    dependencies=[Depends(authenticated)],
+)
+def download_client_qr(client_id: str) -> Response:
+    validate_client_id(client_id)
+    try:
+        qr_svg = awg_peer_manager().client_qr_svg(client_id)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
+    return Response(
+        content=qr_svg,
+        media_type="image/svg+xml",
+        headers={
+            "Content-Disposition": f'inline; filename="lapeace-{client_id}.svg"'
+        },
     )
 
 
 def validate_client_id(client_id: str) -> None:
     if not re.fullmatch(r"[a-f0-9]{64}", client_id):
         raise HTTPException(status_code=400, detail="Invalid peer identifier.")
+
+
+def awg_peer_manager() -> AWGPeerManager:
+    try:
+        return AWGPeerManager(
+            config_path=Path(
+                os.environ.get(
+                    "AWG_CONFIG_FILE",
+                    "/etc/amnezia/amneziawg/awg0.conf",
+                )
+            ),
+            state_path=Path(
+                os.environ.get(
+                    "AWG_CLIENT_STATE_FILE",
+                    "/var/lib/lapeace-agent/awg-clients.json",
+                )
+            ),
+            interface=os.environ.get("AWG_INTERFACE", "awg0"),
+            server_endpoint=os.environ.get("AWG_SERVER_ENDPOINT", ""),
+            client_allowed_ips=os.environ.get(
+                "AWG_CLIENT_ALLOWED_IPS",
+                "0.0.0.0/0",
+            ),
+            client_dns=os.environ.get("AWG_CLIENT_DNS", "1.1.1.1"),
+        )
+    except AWGProvisioningError as error:
+        raise HTTPException(status_code=503, detail=str(error)) from error
+
+
+def _awg_http_error(error: AWGProvisioningError) -> HTTPException:
+    if isinstance(error, AWGClientNotFound):
+        return HTTPException(status_code=404, detail=str(error))
+    if isinstance(error, AWGClientConflict):
+        return HTTPException(status_code=409, detail=str(error))
+    return HTTPException(status_code=503, detail=str(error))
 
 
 @app.middleware("http")

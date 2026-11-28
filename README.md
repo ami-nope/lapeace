@@ -53,12 +53,18 @@ WARP exclusion list. Protected exclusions are not hard-coded; enabling the
 poller requires an explicit confirmation that the complete manual and
 AWG-endpoint exclusion inventory is present in `DYNAMIC_IP_PROTECTED`.
 
-Peer creation, pause/resume, revocation, and client configuration export return
-HTTP 501 and are disabled in the UI. Do not enable them until the existing AWG
-configuration/persistence mechanism and the desired operational behavior have
-been inspected and reviewed. Speed limits and daily-limit enforcement are not
-implemented. No feature is represented as operational until it has been tested
-against the actual VPS setup.
+Peer provisioning and lifecycle operations are implemented locally in the
+agent, but have not been deployed or verified against the VPS. The agent can
+create, pause, resume, regenerate, revoke, export, and render QR codes for
+Lapeace-managed peers through the admin-only `/api/panel/clients` proxy.
+Configuration downloads use `/config`; QR output uses `/config/qr`. Client
+private keys are retained only in the permission-restricted agent state file
+and are returned only in that client's config/QR response. Revoke and
+regenerate requests are rejected while any account references the peer.
+Provision a replacement peer, reassign the account through the existing
+account editor, then revoke the old peer. Speed limits and daily-limit
+enforcement are not implemented. No feature is represented as operational
+until it has been tested against the actual VPS setup.
 
 ## Local development
 
@@ -340,25 +346,37 @@ Until these live checks are run, mark production login, cookies, account
 revocation, Worker route reachability, Dynamic SSH continuity, and VPS
 telemetry as **NOT VERIFIED**.
 
-### Ubuntu VPS agent — read-only stage only
+### Ubuntu VPS agent — local implementation, not deployed
 
-The agent is a separate, read-only adapter for the existing `lapeace-monitor`.
-Do not install or run it until the monitor JSON schema and read permissions have
-been verified on the server. Keep the existing monitor service and its files
-unchanged. The intended listener is loopback only; Vercel needs a separately
-approved HTTPS reverse-proxy or private-tunnel path to reach it. Never expose
-the FastAPI listener directly to the public Internet.
+The telemetry adapter remains read-only against `lapeace-monitor` and
+`usage.json`. The separate peer manager edits only `[Peer]` blocks in the
+authoritative AmneziaWG config and applies matching runtime changes with fixed
+`awg` argument vectors; it does not invoke a shell or restart the interface.
+Do not install or run the new peer operations until their access policy and
+the exact server config have been reviewed. Keep the existing monitor service
+and data unchanged. The intended listener is loopback only; Vercel needs an
+approved HTTPS reverse-proxy or private-tunnel path. Never expose the FastAPI
+listener directly to the public Internet.
 
 1. Verify the existing monitor JSON schema, path, atomic-write behavior, and
    `lapeace-monitor` service identity. Do not share private keys, preshared keys,
    tokens, or endpoint details in diagnostics.
-2. Run the adapter under a dedicated unprivileged identity. Grant it read and
-   directory-traversal access to the monitor JSON only; do not grant write access
-   to `/opt/lapeace/data/usage.json` or to AWG/WARP configuration.
+2. Keep the monitor JSON read-only. Peer operations require narrowly scoped
+   permission to read and atomically replace the AWG config, access the
+   `awg0` interface with `awg set`, and read/write the private client-state
+   file. Review the service identity and least-privilege mechanism before
+   enabling them; do not grant unrelated WARP, firewall, routing, or service
+   management privileges.
 3. Install `agent/requirements.txt` in an isolated virtual environment. Set
    `PANEL_API_TOKEN` to a random secret of at least 32 bytes,
-   `MONITOR_STATE_FILE=/opt/lapeace/data/usage.json`, and `AWG_INTERFACE=awg0`
-   (used as the interface label in the response; the adapter does not query AWG).
+   `MONITOR_STATE_FILE=/opt/lapeace/data/usage.json`,
+   `AWG_INTERFACE=awg0`,
+   `AWG_CONFIG_FILE=/etc/amnezia/amneziawg/awg0.conf`,
+   `AWG_CLIENT_STATE_FILE=/var/lib/lapeace-agent/awg-clients.json`, and
+   `AWG_SERVER_ENDPOINT=<public-hostname-or-IP>:51820`. Configure
+   `AWG_CLIENT_ALLOWED_IPS` and `AWG_CLIENT_DNS` for the intended client routes.
+   The private client keys needed for re-download are stored in the dedicated
+   state file with mode `0600`; protect that file and its parent directory.
 4. Start exactly one Uvicorn worker bound to `127.0.0.1` only:
 
    ```sh
@@ -373,14 +391,20 @@ the FastAPI listener directly to the public Internet.
    API token. Compare the adapter response to a sanitized monitor snapshot,
    verify upload/download direction and IST daily totals, and verify the source
    JSON hash and modification time are unchanged after repeated reads.
-6. Keep peer operations disabled until their persistence-safe implementation,
-   backup/rollback strategy, traffic-control scope, and tests are agreed and
-   verified for this exact server.
+6. Verify provisioning, pause/resume, regeneration, revocation, rollback, and
+   config/QR downloads on a non-production interface or approved maintenance
+   window before enabling these operations against `awg0`. Regeneration changes
+   the peer ID; first provision a replacement, reassign any account through the
+   existing account editor, then revoke the old peer. The web proxy refuses
+   revoke/regenerate when the account store reports that a peer is assigned.
 
-The telemetry path has no shell or subprocess execution and there is no
-arbitrary command endpoint. The separately gated Dynamic SSH poller executes
-only the fixed per-IP WARP commands described below. Neither component runs
-`awg`, `tc`, `ip`, firewall tools, service restarts, or changes routes/NAT.
+There is no arbitrary command endpoint. Provisioning uses only `awg genkey`,
+`awg pubkey`, `awg show <interface> dump`, and `awg set <interface> peer ...`
+with `shell=False`. It preserves the server `[Interface]` section, existing
+peer blocks, obfuscation parameters, NAT, forwarding, WARP routing, and SSH
+access. It does not enforce quotas or bandwidth limits, run `tc`, change
+firewall/routing rules, or restart services. The separately gated Dynamic SSH
+poller remains independent and uses only its fixed `warp-cli` operations.
 
 ## Monitor JSON adapter mapping
 

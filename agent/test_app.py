@@ -267,8 +267,13 @@ def test_snapshot_exposes_per_peer_month_history_without_public_keys(
     assert peer["public_key"] not in response.text
 
 
-def test_agent_operations_require_auth_and_mutations_stay_disabled(monkeypatch):
+def test_agent_operations_require_auth_and_unconfigured_peer_ops_fail_closed(
+    monkeypatch, tmp_path
+):
     monkeypatch.setenv("PANEL_API_TOKEN", TOKEN)
+    monkeypatch.setenv("AWG_SERVER_ENDPOINT", "vpn.example.test:51820")
+    monkeypatch.setenv("AWG_CONFIG_FILE", str(tmp_path / "missing-awg.conf"))
+    monkeypatch.setenv("AWG_CLIENT_STATE_FILE", str(tmp_path / "clients.json"))
     client = TestClient(app)
 
     assert client.get("/api/v1/events").status_code == 401
@@ -281,7 +286,99 @@ def test_agent_operations_require_auth_and_mutations_stay_disabled(monkeypatch):
             "/api/v1/clients",
             json={"label": "phone"},
             headers=headers,
-        ).status_code
-        == 501
+        ).status_code == 503
     )
     assert client.post("/api/v1/exec", headers=headers).status_code == 404
+
+
+def test_peer_lifecycle_endpoints_require_authentication(monkeypatch):
+    monkeypatch.setenv("PANEL_API_TOKEN", TOKEN)
+    client = TestClient(app)
+    client_id = "a" * 64
+
+    responses = [
+        client.post("/api/v1/clients", json={"label": "phone"}),
+        client.post(f"/api/v1/clients/{client_id}/pause"),
+        client.post(f"/api/v1/clients/{client_id}/resume"),
+        client.post(f"/api/v1/clients/{client_id}/regenerate"),
+        client.delete(f"/api/v1/clients/{client_id}"),
+        client.get(f"/api/v1/clients/{client_id}/config"),
+        client.get(f"/api/v1/clients/{client_id}/config/qr"),
+    ]
+
+    assert [response.status_code for response in responses] == [401] * 7
+
+
+def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
+    monkeypatch.setenv("PANEL_API_TOKEN", TOKEN)
+    client_id = "a" * 64
+
+    class StubManager:
+        def create(self, label):
+            return {
+                "clientId": "b" * 64,
+                "label": label,
+                "address": "10.66.67.3/32",
+                "status": "active",
+            }
+
+        def pause(self, value):
+            return {"clientId": value, "status": "paused"}
+
+        def resume(self, value):
+            return {"clientId": value, "status": "active"}
+
+        def regenerate(self, value):
+            return {
+                "clientId": "b" * 64,
+                "previousClientId": value,
+                "address": "10.66.67.3/32",
+                "status": "active",
+            }
+
+        def revoke(self, value):
+            return {"clientId": value, "status": "revoked"}
+
+        def client_config(self, value):
+            assert value == client_id
+            return "[Interface]\nPrivateKey = client-only\n"
+
+        def client_qr_svg(self, value):
+            assert value == client_id
+            return b"<svg/>"
+
+    monkeypatch.setattr("app.awg_peer_manager", StubManager)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {TOKEN}"}
+
+    created = client.post(
+        "/api/v1/clients",
+        json={"label": "phone"},
+        headers=headers,
+    )
+    limited = client.post(
+        "/api/v1/clients",
+        json={"label": "phone", "upload_limit_bps": 1000},
+        headers=headers,
+    )
+    download = client.get(
+        f"/api/v1/clients/{client_id}/config",
+        headers=headers,
+    )
+    qr = client.get(
+        f"/api/v1/clients/{client_id}/config/qr",
+        headers=headers,
+    )
+
+    assert created.status_code == 201
+    assert created.json()["label"] == "phone"
+    assert limited.status_code == 400
+    assert "not implemented" in limited.json()["detail"]
+    assert download.status_code == 200
+    assert download.headers["content-disposition"].endswith(
+        f'lapeace-{client_id}.conf"'
+    )
+    assert "PrivateKey = client-only" in download.text
+    assert qr.status_code == 200
+    assert qr.headers["content-type"].startswith("image/svg+xml")
+    assert qr.content == b"<svg/>"

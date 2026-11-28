@@ -18,18 +18,88 @@ function isAllowed(method: Method, segments: string[]): boolean {
   if (method === "POST" && path === "clients") return true;
   if (
     method === "POST" &&
-    /^clients\/[a-f0-9]{64}\/(pause|resume)$/.test(path)
+    /^clients\/[a-f0-9]{64}\/(pause|resume|regenerate)$/.test(path)
   ) {
     return true;
   }
   if (method === "DELETE" && /^clients\/[a-f0-9]{64}$/.test(path)) return true;
   if (
     method === "GET" &&
-    /^clients\/[a-f0-9]{64}\/config$/.test(path)
+    /^clients\/[a-f0-9]{64}\/config(?:\/qr)?$/.test(path)
   ) {
     return true;
   }
   return false;
+}
+
+function peerDestructiveOperation(method: Method, segments: string[]): string | null {
+  const peerId = segments[1];
+  if (
+    typeof peerId === "string" &&
+    /^[a-f0-9]{64}$/.test(peerId) &&
+    ((method === "DELETE" && segments.length === 2 && segments[0] === "clients") ||
+      (method === "POST" &&
+        segments.length === 3 &&
+        segments[0] === "clients" &&
+        segments[2] === "regenerate"))
+  ) {
+    return peerId;
+  }
+  return null;
+}
+
+async function ensurePeerUnassigned(peerId: string): Promise<Response | null> {
+  let response: Response;
+  try {
+    response = await accountStoreFetch("internal/accounts");
+  } catch {
+    return NextResponse.json(
+      { error: "Cannot verify peer assignments; account store is unavailable." },
+      { status: 503 },
+    );
+  }
+  if (!response.ok) {
+    return NextResponse.json(
+      { error: "Cannot verify peer assignments." },
+      { status: 503 },
+    );
+  }
+
+  let payload: unknown;
+  try {
+    payload = await response.json();
+  } catch {
+    return NextResponse.json(
+      { error: "Account store returned invalid assignment data." },
+      { status: 503 },
+    );
+  }
+  if (
+    typeof payload !== "object" ||
+    payload === null ||
+    !("accounts" in payload) ||
+    !Array.isArray(payload.accounts) ||
+    !payload.accounts.every(
+      (account) =>
+        typeof account === "object" &&
+        account !== null &&
+        "peerId" in account &&
+        typeof account.peerId === "string" &&
+        /^[a-f0-9]{64}$/.test(account.peerId),
+    )
+  ) {
+    return NextResponse.json(
+      { error: "Account store returned invalid assignment data." },
+      { status: 503 },
+    );
+  }
+  if (payload.accounts.some((account) => account.peerId === peerId)) {
+    return NextResponse.json(
+      { error: "Reassign this peer from every account before revoking or regenerating it." },
+      { status: 409 },
+    );
+  }
+  return null;
 }
 
 async function userSummary(accountId: string): Promise<Response> {
@@ -164,6 +234,11 @@ async function proxy(
   if (!isAllowed(method, segments)) {
     return NextResponse.json({ error: "Unknown panel operation." }, { status: 404 });
   }
+  const protectedPeerId = peerDestructiveOperation(method, segments);
+  if (protectedPeerId) {
+    const assignmentError = await ensurePeerUnassigned(protectedPeerId);
+    if (assignmentError) return assignmentError;
+  }
 
   const baseUrl = process.env.AGENT_BASE_URL;
   const apiToken = process.env.AGENT_API_TOKEN;
@@ -228,12 +303,17 @@ async function proxy(
   }
 
   const contentType = upstream.headers.get("content-type") ?? "application/json";
+  const responseHeaders = new Headers({
+    "Content-Type": contentType,
+    "Cache-Control": "no-store",
+  });
+  const disposition = upstream.headers.get("content-disposition");
+  if (disposition) {
+    responseHeaders.set("Content-Disposition", disposition);
+  }
   return new Response(await upstream.arrayBuffer(), {
     status: upstream.status,
-    headers: {
-      "Content-Type": contentType,
-      "Cache-Control": "no-store",
-    },
+    headers: responseHeaders,
   });
 }
 

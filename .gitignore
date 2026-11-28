@@ -20,3 +20,5 @@ __pycache__/
 agent/state.json
 cloudflare/.dev.vars*
 env.md
+.vercel
+.env
