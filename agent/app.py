@@ -19,7 +19,7 @@ from pydantic import BaseModel, Field
 from awg_provisioning import (
     AWGClientConflict,
     AWGClientNotFound,
-    AWGPeerManager,
+    AWGPeerClient,
     AWGProvisioningError,
 )
 from dynamic_ssh import dynamic_sync_loop
@@ -464,7 +464,15 @@ def add_client(payload: AddPeerRequest) -> dict[str, str]:
             detail="Peer quotas and bandwidth enforcement are not implemented.",
         )
     try:
-        return awg_peer_manager().create(payload.label)
+        return awg_peer_client().create(payload.label)
+    except AWGProvisioningError as error:
+        raise _awg_http_error(error) from error
+
+
+@app.get("/api/v1/clients", dependencies=[Depends(authenticated)])
+def list_clients() -> dict[str, list[dict[str, str]]]:
+    try:
+        return {"clients": awg_peer_client().list_clients()}
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
 
@@ -473,7 +481,7 @@ def add_client(payload: AddPeerRequest) -> dict[str, str]:
 def pause_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
     try:
-        return awg_peer_manager().pause(client_id)
+        return awg_peer_client().pause(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
 
@@ -482,7 +490,7 @@ def pause_client(client_id: str) -> dict[str, str]:
 def resume_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
     try:
-        return awg_peer_manager().resume(client_id)
+        return awg_peer_client().resume(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
 
@@ -491,7 +499,7 @@ def resume_client(client_id: str) -> dict[str, str]:
 def revoke_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
     try:
-        return awg_peer_manager().revoke(client_id)
+        return awg_peer_client().revoke(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
 
@@ -503,7 +511,7 @@ def revoke_client(client_id: str) -> dict[str, str]:
 def regenerate_client(client_id: str) -> dict[str, str]:
     validate_client_id(client_id)
     try:
-        return awg_peer_manager().regenerate(client_id)
+        return awg_peer_client().regenerate(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
 
@@ -512,7 +520,7 @@ def regenerate_client(client_id: str) -> dict[str, str]:
 def download_client_config(client_id: str) -> Response:
     validate_client_id(client_id)
     try:
-        config = awg_peer_manager().client_config(client_id)
+        config = awg_peer_client().client_config(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
     return Response(
@@ -531,7 +539,7 @@ def download_client_config(client_id: str) -> Response:
 def download_client_qr(client_id: str) -> Response:
     validate_client_id(client_id)
     try:
-        qr_svg = awg_peer_manager().client_qr_svg(client_id)
+        qr_svg = awg_peer_client().client_qr_svg(client_id)
     except AWGProvisioningError as error:
         raise _awg_http_error(error) from error
     return Response(
@@ -548,31 +556,8 @@ def validate_client_id(client_id: str) -> None:
         raise HTTPException(status_code=400, detail="Invalid peer identifier.")
 
 
-def awg_peer_manager() -> AWGPeerManager:
-    try:
-        return AWGPeerManager(
-            config_path=Path(
-                os.environ.get(
-                    "AWG_CONFIG_FILE",
-                    "/etc/amnezia/amneziawg/awg0.conf",
-                )
-            ),
-            state_path=Path(
-                os.environ.get(
-                    "AWG_CLIENT_STATE_FILE",
-                    "/var/lib/lapeace-agent/awg-clients.json",
-                )
-            ),
-            interface=os.environ.get("AWG_INTERFACE", "awg0"),
-            server_endpoint=os.environ.get("AWG_SERVER_ENDPOINT", ""),
-            client_allowed_ips=os.environ.get(
-                "AWG_CLIENT_ALLOWED_IPS",
-                "0.0.0.0/0",
-            ),
-            client_dns=os.environ.get("AWG_CLIENT_DNS", "1.1.1.1"),
-        )
-    except AWGProvisioningError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
+def awg_peer_client() -> AWGPeerClient:
+    return AWGPeerClient()
 
 
 def _awg_http_error(error: AWGProvisioningError) -> HTTPException:

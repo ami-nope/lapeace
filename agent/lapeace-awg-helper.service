@@ -1,0 +1,32 @@
+[Unit]
+Description=LaPeace privileged AmneziaWG peer helper
+After=network.target lapeace-awg.service
+
+[Service]
+Type=simple
+User=root
+Group=lapeace-agent
+UMask=0007
+RuntimeDirectory=lapeace-awg
+RuntimeDirectoryMode=0750
+StateDirectory=lapeace-awg
+StateDirectoryMode=0700
+EnvironmentFile=/etc/lapeace-awg/helper.env
+WorkingDirectory=/opt/lapeace/agent-app
+ExecStart=/opt/lapeace/agent-venv/bin/python /opt/lapeace/agent-app/awg_helper.py
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_CHOWN
+AmbientCapabilities=CAP_NET_ADMIN
+ReadWritePaths=/etc/amnezia/amneziawg /var/lib/lapeace-awg /run/lapeace-awg
+
+[Install]
+WantedBy=multi-user.target

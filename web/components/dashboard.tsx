@@ -12,7 +12,6 @@ import {
   HardDrive,
   LayoutDashboard,
   LogOut,
-  Plus,
   RefreshCw,
   Shield,
   Signal,
@@ -588,18 +587,6 @@ export function Dashboard({ role }: { role: "admin" | "user" }) {
               <Metric label="Upload throughput" value={formatRate(snapshot?.interface.rxBps)} detail={`PEER AGGREGATE ${formatBytes(snapshot?.interface.rxBytes)}`} icon={ArrowUpFromLine} accent="text-[#d8a64e]" />
               <Metric label="Download throughput" value={formatRate(snapshot?.interface.txBps)} detail={`PEER AGGREGATE ${formatBytes(snapshot?.interface.txBytes)}`} icon={ArrowDownToLine} />
             </div>
-
-            <section className="flex flex-wrap items-center justify-between gap-2 border border-[#5a482a] bg-[#17140e] px-3 py-2">
-              <div className="flex items-start gap-2">
-                <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0 text-[#d8a64e]" aria-hidden="true" />
-                <p className="text-[10px] leading-5 text-[#c9b88e]">
-                  Peer changes are locked until the existing AWG persistence is inspected. This panel is read-only.
-                </p>
-              </div>
-              <Button disabled size="small" variant="outline" title="Enable after AWG persistence review">
-                <Plus className="h-3 w-3" aria-hidden="true" /> ADD PEER
-              </Button>
-            </section>
 
             <section className="panel" aria-labelledby="dynamic-ssh-title">
               <div className="panel-heading">

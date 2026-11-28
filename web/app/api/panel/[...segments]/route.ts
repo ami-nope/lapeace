@@ -15,6 +15,7 @@ type Method = "GET" | "POST" | "DELETE";
 function isAllowed(method: Method, segments: string[]): boolean {
   const path = segments.join("/");
   if (method === "GET" && (path === "snapshot" || path === "events")) return true;
+  if (method === "GET" && path === "clients") return true;
   if (method === "POST" && path === "clients") return true;
   if (
     method === "POST" &&

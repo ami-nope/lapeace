@@ -271,9 +271,6 @@ def test_agent_operations_require_auth_and_unconfigured_peer_ops_fail_closed(
     monkeypatch, tmp_path
 ):
     monkeypatch.setenv("PANEL_API_TOKEN", TOKEN)
-    monkeypatch.setenv("AWG_SERVER_ENDPOINT", "vpn.example.test:51820")
-    monkeypatch.setenv("AWG_CONFIG_FILE", str(tmp_path / "missing-awg.conf"))
-    monkeypatch.setenv("AWG_CLIENT_STATE_FILE", str(tmp_path / "clients.json"))
     client = TestClient(app)
 
     assert client.get("/api/v1/events").status_code == 401
@@ -298,6 +295,7 @@ def test_peer_lifecycle_endpoints_require_authentication(monkeypatch):
 
     responses = [
         client.post("/api/v1/clients", json={"label": "phone"}),
+        client.get("/api/v1/clients"),
         client.post(f"/api/v1/clients/{client_id}/pause"),
         client.post(f"/api/v1/clients/{client_id}/resume"),
         client.post(f"/api/v1/clients/{client_id}/regenerate"),
@@ -306,7 +304,7 @@ def test_peer_lifecycle_endpoints_require_authentication(monkeypatch):
         client.get(f"/api/v1/clients/{client_id}/config/qr"),
     ]
 
-    assert [response.status_code for response in responses] == [401] * 7
+    assert [response.status_code for response in responses] == [401] * 8
 
 
 def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
@@ -321,6 +319,16 @@ def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
                 "address": "10.66.67.3/32",
                 "status": "active",
             }
+
+        def list_clients(self):
+            return [
+                {
+                    "clientId": "b" * 64,
+                    "label": "phone",
+                    "address": "10.66.67.3/32",
+                    "status": "active",
+                }
+            ]
 
         def pause(self, value):
             return {"clientId": value, "status": "paused"}
@@ -347,7 +355,7 @@ def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
             assert value == client_id
             return b"<svg/>"
 
-    monkeypatch.setattr("app.awg_peer_manager", StubManager)
+    monkeypatch.setattr("app.awg_peer_client", StubManager)
     client = TestClient(app)
     headers = {"Authorization": f"Bearer {TOKEN}"}
 
@@ -356,6 +364,7 @@ def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
         json={"label": "phone"},
         headers=headers,
     )
+    listed = client.get("/api/v1/clients", headers=headers)
     limited = client.post(
         "/api/v1/clients",
         json={"label": "phone", "upload_limit_bps": 1000},
@@ -372,6 +381,9 @@ def test_peer_lifecycle_routes_return_downloadable_config_and_qr(monkeypatch):
 
     assert created.status_code == 201
     assert created.json()["label"] == "phone"
+    assert listed.status_code == 200
+    assert listed.json()["clients"][0]["address"] == "10.66.67.3/32"
+    assert "privateKey" not in listed.text
     assert limited.status_code == 400
     assert "not implemented" in limited.json()["detail"]
     assert download.status_code == 200
